@@ -17,10 +17,12 @@ class Config:
     # ------------------------------------------------------------------ #
     # Particle Filter
     # ------------------------------------------------------------------ #
-    N: int = 1000                    # number of particles
-    process_noise_std: float = 0.01  # std of process noise added during propagation
-    obs_noise_std: float = 0.005     # tight std for joint-state dims (cos/sin/qdot)
-    obs_noise_std_obj: float = 0.02  # looser std for object position dims
+    N: int = 1000                        # number of particles
+    process_noise_std: float = 0.01      # std of process noise for joint dims (q, qdot)
+    process_noise_std_obj: float = 0.05  # std of process noise for object-state dims
+    obs_noise_std: float = 0.05          # tolerance for joint-state model mismatch
+    obs_noise_std_obj: float = 0.1       # tolerance for object position (highly uncertain)
+    resample_threshold: float = 0.5      # resample only when ESS < threshold * N
 
     # ------------------------------------------------------------------ #
     # MPPI

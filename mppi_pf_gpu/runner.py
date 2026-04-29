@@ -114,8 +114,12 @@ def run(config: Config, render: bool = False):
         #    metric useless for the future scheduler.
         ess = pf.effective_sample_size()
 
-        # 3. Systematic resampling
-        pf.resample()
+        # 3. Adaptive resampling: only resample when diversity falls below
+        #    the threshold.  Always resampling every step destroys diversity
+        #    once the cloud collapses — adaptive resampling lets the PF
+        #    recover naturally via the process noise.
+        if ess < config.resample_threshold * config.N:
+            pf.resample()
 
         # 4. Sample K initial states from belief for MPPI rollouts
         initial_states = pf.sample(mppi.K)          # (K, state_dim) on GPU

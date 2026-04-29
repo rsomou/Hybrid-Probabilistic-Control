@@ -103,6 +103,7 @@ class ParticleFilter:
                 action_gpu,
                 noise,
                 cp.float32(self.config.process_noise_std),
+                cp.float32(self.config.process_noise_std_obj),
                 cp.float32(self.config.dt),
                 np.int32(self.N),
             ),

@@ -121,10 +121,11 @@ void weighted_eps_update(
 PF_PROPAGATE_KERNEL = r"""
 extern "C" __global__
 void pf_propagate(
-    float*       __restrict__ particles,       // (N, STATE_DIM)  in/out
-    const float* __restrict__ action,          // (ACTION_DIM,)
-    const float* __restrict__ noise,           // (N, STATE_DIM) pre-generated
-    float process_noise_std,
+    float*       __restrict__ particles,          // (N, STATE_DIM)  in/out
+    const float* __restrict__ action,             // (ACTION_DIM,)
+    const float* __restrict__ noise,              // (N, STATE_DIM) pre-generated
+    float process_noise_std,      // std for joint dims d < 2*NUM_JOINTS
+    float process_noise_std_obj,  // std for object-state dims d >= 2*NUM_JOINTS
     float dt,
     int N
 ) {
@@ -146,9 +147,12 @@ void pf_propagate(
     // Advance dynamics in place
     f_pusher(state, act, dt);
 
-    // Write back with additive process noise
+    // Write back with per-component additive process noise:
+    //   joint dims (d < 2*NUM_JOINTS = 14): use tight process_noise_std
+    //   object-state dims (d >= 14):        use loose process_noise_std_obj
     for (int d = 0; d < STATE_DIM; d++) {
-        particles[i * STATE_DIM + d] = state[d] + process_noise_std * noise[i * STATE_DIM + d];
+        float ns = (d < 2 * NUM_JOINTS) ? process_noise_std : process_noise_std_obj;
+        particles[i * STATE_DIM + d] = state[d] + ns * noise[i * STATE_DIM + d];
     }
 }
 """
