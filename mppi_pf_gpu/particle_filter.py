@@ -4,7 +4,7 @@ GPU-resident bootstrap particle filter.
 
 All arrays (particles, weights) live on the GPU for the entire episode.
 Only three things cross the bus per step:
-  CPU → GPU : pf_obs (16 floats: q, qdot, obj_xy) via update()
+  CPU → GPU : pf_obs (14 floats: q, qdot) via update()  — obj_pos hidden
   CPU → GPU : action vector     (7 floats)  via propagate()
   GPU → CPU : weighted-mean state estimate  via estimate()
               ESS scalar                    via effective_sample_size()
@@ -115,15 +115,18 @@ class ParticleFilter:
 
     def update(self, obs: np.ndarray):
         """
-        Multiply each particle's weight by its observation likelihood.
+        Likelihood-based weight update for partially-observed Pusher-v5.
+
+        The PF observes only q and qdot (14 dims).  Object position is hidden,
+        so particles that predicted different obj_pos values will have diverged
+        in their predicted q/qdot (via contact forces).  This creates genuine
+        likelihood differences — the PF can discriminate particles based on
+        how well their arm state prediction matches the measured arm state.
 
         Parameters
         ----------
-        obs : (obs_dim,) numpy array — current observation from env
-
-        After multiplication weights are renormalised via GPUUtils.
+        obs : (23,) numpy array — raw Pusher-v5 gym observation
         """
-        # Convert raw 23-dim gym obs → 16-dim PF obs: [q, qdot, obj_x, obj_y]
         obs_gpu     = cp.asarray(self.dynamics.gym_obs_to_pf_obs(obs), dtype=cp.float32)
         grid, block = self.gpu.get_grid_block(self.N)
 

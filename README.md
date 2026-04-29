@@ -2,6 +2,8 @@
 
 GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Implemented in Python/CuPy with raw CUDA kernels. Tested on MuJoCo **Pusher-v5** via Gymnasium.
 
+The environment is made **partially observable** (Option 1): the object position (`obs[17:19]`) is masked from the controller, so the particle filter must infer where the object is from indirect cues — contact forces that perturb the arm's joint state. This makes the particle filter genuinely necessary rather than decorative.
+
 ---
 
 ## Repository Structure
@@ -87,29 +89,47 @@ This warm-start means each optimisation step begins from the previous solution.
 ```
 CPU (runner.py)                         GPU (CUDA kernels)
 ────────────────                        ──────────────────────────────────
-obs from env  ────────────────────────► pf_weight_update   (N threads)
+gym obs (23-dim)                        
+  → gym_obs_to_pf_obs() strips to 14-dim (q, qdot only; obj_pos HIDDEN)
+pf_obs (14 floats) ──────────────────► pf_weight_update   (N threads)
                                          pf resampling      (cumsum + searchsorted)
                                          pf.sample(K)       (gather K particles)
                       K initial states ◄─
-mppi.compute_action(states) ──────────► mppi_rollout        (K threads x H steps)
+mppi.compute_action(states) ──────────► mppi_rollout        (K threads × H steps)
                                          compute_importance_weights  (K threads)
-                                         weighted_eps_update  (H x 7 threads)
+                                         weighted_eps_update  (H × 7 threads)
                       action u_bar[0] ◄─
 env.step(action) ──► obs, reward
 pf.propagate(action) ───────────────►   pf_propagate        (N threads)
 ```
 
-Only ~35 floats cross the CPU-GPU bus per step (21 obs in, 7 action out, 1 ESS scalar) regardless of $K$ or $N$. All particles, weights, perturbations, and rollout costs stay resident on-device for the full episode.
+Only ~29 floats cross the CPU-GPU bus per step (14 pf_obs in, 7 action in, 7 action out, 1 ESS scalar) regardless of $K$ or $N$. All particles, weights, perturbations, and rollout costs stay resident on-device for the full episode.
 
 ---
 
 ## Pusher-v5 Environment
 
-Pusher-v5 is a MuJoCo environment from Gymnasium in which a 7-DOF planar robotic arm must push a small cylinder to a fixed goal position on a table. The arm is controlled by joint torques; the object moves only through contact with the fingertip. There is no gripper -- the task requires the controller to plan an approach trajectory, make contact, and push the object to the goal without being able to grasp it.
+Pusher-v5 is a MuJoCo environment from Gymnasium in which a 7-DOF planar robotic arm must push a small cylinder to a fixed goal position on a table. The arm is controlled by joint torques; the object moves only through contact with the fingertip. There is no gripper — the task requires the controller to plan an approach trajectory, make contact, and push the object to the goal without being able to grasp it.
 
 **Gymnasium observation (23-dim):** `[q(7), qdot(7), fingertip_xyz(3), obj_xyz(3), goal_xyz(3)]`
 
-The raw gym observation is a flattened vector of joint angles, joint velocities, and 3-D Cartesian positions of the fingertip, object, and goal. It does not include object velocity, which the particle filter must implicitly track through the latent state.
+The raw gym observation is a flattened vector of joint angles, joint velocities, and 3-D Cartesian positions of the fingertip, object, and goal.
+
+### Partial Observability (Option 1)
+
+The controller **never sees the object position**. Before any observation reaches the particle filter or MPPI, `gym_obs_to_pf_obs()` strips it down to 14 dimensions:
+
+| Gym obs indices | Content | Given to PF? |
+|---|---|---|
+| `[0:7]` | Joint angles q | ✅ Yes |
+| `[7:14]` | Joint velocities qdot | ✅ Yes |
+| `[14:17]` | Fingertip position (x,y,z) | ❌ Skipped |
+| `[17:20]` | Object position (x,y,z) | ❌ **Hidden** |
+| `[20:23]` | Goal position (x,y,z) | ❌ Skipped (read once at reset) |
+
+The particle filter must **infer** the object position from indirect evidence: when the fingertip contacts the object, the resulting forces perturb the arm's joint state differently depending on where the object is. Particles with incorrect object position predictions will produce joint-state predictions that diverge from the measured joint state, causing their weights to decrease. This makes the particle filter genuinely necessary.
+
+At episode start, particles sample object positions from the Pusher-v5 initial prior ($x \sim U[-0.3, 0.0]$, $y \sim U[-0.2, 0.2]$) rather than peeking at the true position.
 
 **Internal state tracked by the particle filter (18-dim):** `[q(7), qdot(7), obj_pos_2d(2), obj_vel_2d(2)]`
 
@@ -121,13 +141,15 @@ $$\ddot{q}_i = (\tau_i - d \cdot \dot{q}_i) / m_i, \qquad \dot{q}^+ = \dot{q} + 
 
 with damping $d = 0.1$, mass $m_i = 1.0$ per joint, and $\Delta t = 0.05$ s (semi-implicit Euler).
 
-**Contact model:** Forward kinematics computes the fingertip position as a sum of planar link vectors. If the fingertip is within `CONTACT_RADIUS = 0.06 m` of the object, a push impulse proportional to the contact-normal component of the fingertip velocity is applied to the object. The contact normal is the unit vector from the object center to the fingertip.
+**Contact model:** Forward kinematics computes the fingertip position as a sum of planar link vectors. If the fingertip is within `CONTACT_RADIUS = 0.06 m` of the object, a push impulse proportional to the positive contact-normal component of the fingertip velocity is applied to the object. The velocity component is clamped to zero so contact can only push, never pull. The contact normal is the unit vector from the fingertip to the object center.
 
-**Running cost:**
+**Running cost (negated Pusher-v5 reward):**
 
-$$c(s, a) = 1.0 \|\text{tip} - \text{obj}\| + 5.0 \|\text{obj} - \text{goal}\| + 0.1 \|a\|^2$$
+The Pusher-v5 reward is $r = -0.5\|\text{tip} - \text{obj}\| - 1.0\|\text{obj} - \text{goal}\| - 0.1\|a\|^2$. MPPI minimises cost = $-r$:
 
-The first term encourages the arm to stay near the object; the second penalises object distance from the goal (weighted higher to prioritise task completion); the third penalises large torques. The CUDA version in `kernels/pusher_kernels.py` uses `sinf`/`cosf`/`sqrtf` and must remain numerically identical to the numpy version in `envs/pusher.py`.
+$$c(s, a) = 0.5 \|\text{tip} - \text{obj}\| + 1.0 \|\text{obj} - \text{goal}\| + 0.1 \|a\|^2$$
+
+The first term encourages the arm to stay near the object; the second penalises object distance from the goal; the third penalises large torques. The CUDA version in `kernels/pusher_kernels.py` uses `sinf`/`cosf`/`sqrtf` and must remain numerically identical to the numpy version in `envs/pusher.py`.
 
 ---
 
@@ -140,14 +162,17 @@ Single `@dataclass` passed by reference to every component. No global state.
 |---|---|---|
 | `env_name` | `"Pusher-v5"` | Gymnasium environment ID |
 | `N` | `1000` | Particle filter particle count |
-| `process_noise_std` | `0.01` | Particle propagation noise std |
-| `obs_noise_std` | `0.05` | Observation likelihood noise std |
+| `process_noise_std` | `0.005` | Process noise std for joint dims (tight: arm well-modelled) |
+| `process_noise_std_obj` | `0.05` | Process noise std for object-state dims (loose: contact uncertain) |
+| `obs_noise_std` | `0.05` | Observation likelihood noise std for joint dims |
+| `obs_noise_std_obj` | `0.1` | Kept for kernel signature; unreachable with OBS_DIM=14 |
+| `resample_threshold` | `0.5` | Resample only when ESS < threshold × N |
 | `K` | `1024` | MPPI trajectory samples |
 | `H` | `30` | MPPI planning horizon |
 | `lambda_` | `1.0` | MPPI temperature |
 | `sigma` | `0.5` | MPPI perturbation std |
 | `max_steps` | `300` | Episode length cap |
-| `dt` | `0.05` | Integration timestep |
+| `dt` | `0.05` | Integration timestep (frame_skip=5 × inner_dt=0.01) |
 | `threads_per_block` | `256` | CUDA threads per block |
 | `device_id` | `0` | CUDA device index |
 | `deadline_ms` | `50.0` | Per-step deadline (for future scheduler) |
@@ -182,7 +207,8 @@ Stateless CuPy utilities. All GPU math goes through this layer.
 ### `particle_filter.py`
 Bootstrap SIR particle filter; full particle cloud lives on GPU.
 
-- `update(obs)` -- `pf_weight_update` kernel, then normalise
+- `initialize(obs)` -- bootstraps N particles from first 23-dim gym obs; object positions sampled from prior (not peeked from obs)
+- `update(obs)` -- calls `gym_obs_to_pf_obs()` to strip obs to 14-dim, then runs `pf_weight_update` kernel comparing particle joint-state predictions against measured joint state; normalises weights
 - `resample()` -- systematic resampling via `cp.cumsum` + `cp.searchsorted`; resets weights to uniform
 - `sample(K)` -- draw K particles proportional to weights for MPPI initialisation
 - `propagate(action)` -- `pf_propagate` kernel; called after `env.step()`
@@ -206,8 +232,8 @@ Additional kernels:
 
 | Kernel | Threads | Description |
 |---|---|---|
-| `pf_propagate` | 1 per particle | Applies `f_pusher` + process noise |
-| `pf_weight_update` | 1 per particle | Multiplies weight by Gaussian likelihood via `particle_to_obs()` |
+| `pf_propagate` | 1 per particle | Applies `f_pusher` + process noise (tight for joints, loose for object) |
+| `pf_weight_update` | 1 per particle | Compares particle's predicted joint state (14-dim) against measured joint state; multiplies weight by Gaussian likelihood. Object position is hidden — only joint q/qdot are compared. |
 
 ### `runner.py`
 CPU control loop. Constructs all components, runs the episode, saves `timing_log.npy`.

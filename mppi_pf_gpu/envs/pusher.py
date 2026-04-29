@@ -15,10 +15,11 @@ True Pusher-v5 Gymnasium observation (23-dim, float64):
     [17:20] obj_pos        — (x, y, z) in metres
     [20:23] goal_pos       — (x, y, z) FIXED: always (0.45, -0.05, -0.323)
 
-PF observation (OBS_DIM = 16):
-    gym_obs_to_pf_obs() extracts [q(7), qdot(7), obj_x, obj_y]
-    = obs[0:14] + obs[17:19]. This maps 1-to-1 onto particle state[0:16],
-    so particle_to_obs() in the CUDA kernel is a direct state lookup.
+PF observation (OBS_DIM = 14)  — PARTIALLY OBSERVED:
+    gym_obs_to_pf_obs() returns ONLY obs[0:14] = [q(7), qdot(7)].
+    Object position (obs[17:19]) is deliberately withheld from the controller.
+    The particle filter must infer obj_pos from contact cues in the arm
+    dynamics and the initial prior.  This makes the PF genuinely necessary.
 
 We store target_pos (x, y only) from obs[20:22] each episode reset.
 
@@ -53,11 +54,12 @@ FRICTION       = 0.2        # object sliding friction coefficient
 
 STATE_DIM  = 18             # 7q + 7qdot + 2 obj_pos + 2 obj_vel
 ACTION_DIM = 7
-# PF uses [q(7), qdot(7), obj_x, obj_y]: a 16-dim direct slice of particle state.
-# gym_obs_to_pf_obs() maps the 23-dim gym obs into this vector.
-OBS_DIM    = 16             # q(7) + qdot(7) + obj_x + obj_y
+# PARTIAL OBSERVABILITY: PF sees only [q(7), qdot(7)] — object position is hidden.
+# gym_obs_to_pf_obs() returns obs[0:14] only. The PF must infer obj_pos from
+# contact dynamics (indirect evidence via arm state when fingertip hits object).
+OBS_DIM    = 14             # q(7) + qdot(7) only — obj_pos intentionally withheld
 
-# Pusher-v4 action bounds (verified at runtime against env.action_space)
+# Pusher-v5 action bounds (verified at runtime against env.action_space)
 ACTION_BOUND = 2.0
 
 
@@ -157,7 +159,7 @@ class PusherDynamics(AnalyticalDynamics):
             push_dir    = diff / dist                    # unit vector
             # Component of tip velocity along push direction
             tip_vel     = np.array([tip_vx, tip_vy])
-            v_component = float(tip_vel @ push_dir)
+            v_component = max(0.0, float(tip_vel @ push_dir))  # contact can only push, not pull
             push_force  = PUSH_STRENGTH * v_component
             obj_vel    += push_force * push_dir * dt
 
@@ -179,11 +181,16 @@ class PusherDynamics(AnalyticalDynamics):
 
     def cost_numpy(self, state: np.ndarray, action: np.ndarray) -> float:
         """
-        Running cost matching the CUDA cost_pusher device function.
+        Running cost matching the Pusher-v5 reward (negated for minimisation).
 
-        cost = 1.0 * ||fingertip - obj_pos||
-             + 5.0 * ||obj_pos  - target_pos||
-             + 0.1 * ||action||^2
+        Pusher-v5 reward:
+          reward_near = -0.5 * ||fingertip - obj_pos||
+          reward_dist = -1.0 * ||obj_pos   - goal_pos||
+          reward_ctrl = -0.1 * ||action||^2
+
+        cost = -reward = 0.5 * ||fingertip - obj_pos||
+                       + 1.0 * ||obj_pos   - target_pos||
+                       + 0.1 * ||action||^2
         """
         state  = np.asarray(state, dtype=np.float64)
         action = np.asarray(action, dtype=np.float64)
@@ -198,8 +205,8 @@ class PusherDynamics(AnalyticalDynamics):
         dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
         action_cost     = float(np.dot(action, action))
 
-        return (1.0 * dist_tip_obj
-                + 5.0 * dist_obj_target
+        return (0.5 * dist_tip_obj
+                + 1.0 * dist_obj_target
                 + 0.1 * action_cost)
 
     # ------------------------------------------------------------------ #
@@ -208,27 +215,36 @@ class PusherDynamics(AnalyticalDynamics):
 
     def obs_model(self, state: np.ndarray) -> np.ndarray:
         """
-        Maps internal particle state → 16-dim PF observation vector:
-          [q(7), qdot(7), obj_x, obj_y] = state[0:16]
-        Direct slice — no trig — mirrors particle_to_obs() in the CUDA kernel.
+        Maps internal particle state → 14-dim PF observation vector:
+          [q(7), qdot(7)] = state[0:14]
+
+        PARTIAL OBSERVABILITY (Option 1): only joint angles and velocities
+        are observable. Object position (state[14:16]) is hidden — the PF
+        must infer it from contact dynamics in the prior.
+
+        This mirrors particle_to_obs() in the CUDA weight kernel, which
+        also reads only state[0:OBS_DIM] where OBS_DIM=14.
         """
-        return np.asarray(state, dtype=np.float32)[0:16]
+        return np.asarray(state, dtype=np.float32)[0:OBS_DIM]
 
     def gym_obs_to_pf_obs(self, obs: np.ndarray) -> np.ndarray:
         """
-        Extract the 16-dim PF observation from a raw 23-dim Pusher-v5 gym obs.
+        Extract the 14-dim PF observation from a raw 23-dim Pusher-v5 gym obs.
+
+        PARTIAL OBSERVABILITY: object position (obs[17:19]) is intentionally
+        withheld from the controller.  The PF sees only joint state, forcing
+        it to track object position via contact dynamics in the prior.
 
         Pusher-v5 obs layout:
-          [0:7]   q              raw joint angles
-          [7:14]  qdot           joint velocities
-          [14:17] fingertip_pos  (x, y, z) — skipped
-          [17:20] obj_pos        (x, y, z)
-          [20:23] goal_pos       (x, y, z) — skipped
+          [0:7]   q              raw joint angles          → included
+          [7:14]  qdot           joint velocities          → included
+          [14:17] fingertip_pos  (x, y, z)                → skipped
+          [17:20] obj_pos        (x, y, z)                → MASKED (hidden)
+          [20:23] goal_pos       (x, y, z)                → skipped
 
-        Returns [q(7), qdot(7), obj_x, obj_y] = obs[0:14] + obs[17:19].
+        Returns obs[0:14] = [q(7), qdot(7)] only.
         """
-        obs = np.asarray(obs, dtype=np.float32)
-        return np.concatenate([obs[0:14], obs[17:19]])
+        return np.asarray(obs, dtype=np.float32)[0:14]
 
     # ------------------------------------------------------------------ #
     # Particle initialisation
@@ -238,33 +254,44 @@ class PusherDynamics(AnalyticalDynamics):
         """
         Bootstrap N particles from the first Pusher-v5 observation.
 
+        PARTIAL OBSERVABILITY (Option 1):
+        The true object position obs[17:19] is NOT used.  Instead, object
+        positions are sampled from the Pusher-v5 starting-state prior:
+          x ~ Uniform(-0.3, 0.0)
+          y ~ Uniform(-0.2, 0.2)
+        This ensures the PF never peeks at the hidden object position.
+
+        Joint angles and velocities ARE observable (obs[0:14]).
+
         Pusher-v5 obs layout (23-dim):
-          [0:7]   q              raw joint angles (rad)
-          [7:14]  qdot           joint velocities (rad/s)
-          [14:17] fingertip_pos  (x, y, z)
-          [17:20] obj_pos        (x, y, z)  ← seeds particle obj_pos
-          [20:23] goal_pos       (x, y, z)
+          [0:7]   q              raw joint angles (rad)      → used
+          [7:14]  qdot           joint velocities (rad/s)    → used
+          [14:17] fingertip_pos  (x, y, z)                   → skipped
+          [17:20] obj_pos        (x, y, z)                   → HIDDEN
+          [20:23] goal_pos       (x, y, z)                   → skipped
         """
         obs = np.asarray(obs, dtype=np.float64)
 
-        q      = obs[0:7]    # raw joint angles (v5 layout: q at [0:7], NOT cos(q))
-        qdot   = obs[7:14]   # joint velocities
-        obj_xy = obs[17:19]  # object position x, y
+        q    = obs[0:7]    # raw joint angles (v5: q at [0:7], NOT cos(q))
+        qdot = obs[7:14]   # joint velocities
 
         particles = np.zeros((N, STATE_DIM), dtype=np.float32)
 
-        # Tile deterministic baseline across all N particles
+        # Tile deterministic joint state across all N particles
         particles[:, 0:7]  = np.tile(q.astype(np.float32),    (N, 1))
         particles[:, 7:14] = np.tile(qdot.astype(np.float32), (N, 1))
 
-        # Seed obj_pos from observed value — spread particles around it
-        particles[:, 14:16] = (np.tile(obj_xy.astype(np.float32), (N, 1))
-                                + np.random.normal(0.0, 0.02, (N, 2)).astype(np.float32))
-        particles[:, 16:18] = np.random.normal(0.0, 0.01, (N, 2)).astype(np.float32)
+        # Object position: sample from Pusher-v5 initial prior (NOT from obs)
+        #   x ~ Uniform(-0.3, 0.0),  y ~ Uniform(-0.2, 0.2)
+        particles[:, 14] = np.random.uniform(-0.3, 0.0, N).astype(np.float32)
+        particles[:, 15] = np.random.uniform(-0.2, 0.2, N).astype(np.float32)
 
-        # Small jitter so initial cloud is not degenerate
+        # Object velocity: zero prior (Pusher-v5 starts with zero obj velocity)
+        particles[:, 16:18] = 0.0
+
+        # Small jitter on joint dims so initial cloud is not degenerate
         particles[:, 0:7]  += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
-        particles[:, 7:14] += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
+        particles[:, 7:14] += np.random.normal(0.0, 0.005, (N, 7)).astype(np.float32)
 
         return particles
 
@@ -324,7 +351,7 @@ _PUSHER_CUDA_CODE = r"""
 #define STATE_DIM       18
 #define ACTION_DIM      7
 #define NUM_JOINTS      7
-#define OBS_DIM         16      /* q(7)+qdot(7)+obj_x+obj_y — PF weight kernel only */
+#define OBS_DIM         14      /* q(7)+qdot(7) only — obj_pos withheld (partial obs) */
 #define LINK_LENGTH     0.1f
 #define DAMPING         0.1f
 #define LINK_MASS       1.0f
@@ -424,6 +451,7 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         float push_dir_x = dx * inv_dist;
         float push_dir_y = dy * inv_dist;
         float v_comp     = tip_vx * push_dir_x + tip_vy * push_dir_y;
+        v_comp           = fmaxf(v_comp, 0.0f);  /* contact can only push, not pull */
         float push_force = PUSH_STRENGTH * v_comp;
         obj_vel[0]      += push_force * push_dir_x * dt;
         obj_vel[1]      += push_force * push_dir_y * dt;
@@ -444,8 +472,13 @@ __device__ void f_pusher(float* state, const float* action, float dt)
 }
 
 /* ------------------------------------------------------------------ */
-/* cost_pusher: running cost for MPPI rollouts                          */
-/* target: (2,) — 2-D target position                                  */
+/* cost_pusher: running cost for MPPI rollouts (negated Pusher-v5 reward) */
+/* Pusher-v5 reward:                                                    */
+/*   reward_near = -0.5 * ||fingertip - obj_pos||                      */
+/*   reward_dist = -1.0 * ||obj_pos   - goal_pos||                     */
+/*   reward_ctrl = -0.1 * ||action||^2                                 */
+/* cost = -reward = 0.5*d_near + 1.0*d_dist + 0.1*||a||^2             */
+/* target: (2,) — 2-D goal position                                    */
 /* ------------------------------------------------------------------ */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target)
@@ -456,22 +489,22 @@ __device__ float cost_pusher(const float* state, const float* action,
     float tip_x, tip_y;
     forward_kinematics(q, &tip_x, &tip_y);
 
-    /* ||fingertip - obj_pos|| */
+    /* reward_near: ||fingertip - obj_pos|| */
     float dx1  = tip_x - obj_pos[0];
     float dy1  = tip_y - obj_pos[1];
     float d1   = sqrtf(dx1 * dx1 + dy1 * dy1);
 
-    /* ||obj_pos - target_pos|| */
+    /* reward_dist: ||obj_pos - target_pos|| */
     float dx2  = obj_pos[0] - target[0];
     float dy2  = obj_pos[1] - target[1];
     float d2   = sqrtf(dx2 * dx2 + dy2 * dy2);
 
-    /* ||action||^2 */
+    /* reward_ctrl: ||action||^2 */
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) {
         act2 += action[a] * action[a];
     }
 
-    return 1.0f * d1 + 5.0f * d2 + 0.1f * act2;
+    return 0.5f * d1 + 1.0f * d2 + 0.1f * act2;
 }
 """

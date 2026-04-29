@@ -4,7 +4,7 @@ All hyperparameters and GPU settings for the MPPI + Particle Filter system.
 Scheduler placeholder fields are included for future deadline-aware scheduling.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -18,10 +18,10 @@ class Config:
     # Particle Filter
     # ------------------------------------------------------------------ #
     N: int = 1000                        # number of particles
-    process_noise_std: float = 0.01      # std of process noise for joint dims (q, qdot)
-    process_noise_std_obj: float = 0.05  # std of process noise for object-state dims
-    obs_noise_std: float = 0.05          # tolerance for joint-state model mismatch
-    obs_noise_std_obj: float = 0.1       # tolerance for object position (highly uncertain)
+    process_noise_std: float = 0.005     # std of process noise for joint dims (tight: arm is well-modelled)
+    process_noise_std_obj: float = 0.05  # std of process noise for object-state dims (loose: contact uncertain)
+    obs_noise_std: float = 0.05          # likelihood std for joint dims — matches simplified dynamics error
+    obs_noise_std_obj: float = 0.1       # unused with OBS_DIM=14 but kept for kernel signature
     resample_threshold: float = 0.5      # resample only when ESS < threshold * N
 
     # ------------------------------------------------------------------ #

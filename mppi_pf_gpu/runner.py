@@ -23,7 +23,7 @@ This matches the data format the future deadline-aware scheduler expects.
 
 CPU-GPU bus crossings per step
 ------------------------------
-  CPU → GPU : pf_obs (16 floats: q, qdot, obj_xy)  — in pf.update()
+  CPU → GPU : pf_obs (14 floats: q, qdot)  — in pf.update()  (obj_pos hidden)
   CPU → GPU : action         (7 floats)    — in pf.propagate()
   GPU → CPU : u_bar[0]       (7 floats)    — from mppi.compute_action()
   GPU → CPU : ESS            (1 float)     — from pf.effective_sample_size()
@@ -64,7 +64,7 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
 
 def run(config: Config, render: bool = False):
     """
-    Execute one episode of Pusher-v4 with MPPI + Particle Filter.
+    Execute one episode of Pusher-v5 with MPPI + Particle Filter.
 
     Parameters
     ----------
