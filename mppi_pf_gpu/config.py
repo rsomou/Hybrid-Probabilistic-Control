@@ -19,7 +19,8 @@ class Config:
     # ------------------------------------------------------------------ #
     N: int = 1000                    # number of particles
     process_noise_std: float = 0.01  # std of process noise added during propagation
-    obs_noise_std: float = 0.05      # std used in likelihood computation
+    obs_noise_std: float = 0.005     # tight std for joint-state dims (cos/sin/qdot)
+    obs_noise_std_obj: float = 0.02  # looser std for object position dims
 
     # ------------------------------------------------------------------ #
     # MPPI

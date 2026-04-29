@@ -23,7 +23,7 @@ This matches the data format the future deadline-aware scheduler expects.
 
 CPU-GPU bus crossings per step
 ------------------------------
-  CPU → GPU : obs[:obs_dim]  (21 floats)   — in pf.update()
+  CPU → GPU : pf_obs (16 floats: q, qdot, obj_xy)  — in pf.update()
   CPU → GPU : action         (7 floats)    — in pf.propagate()
   GPU → CPU : u_bar[0]       (7 floats)    — from mppi.compute_action()
   GPU → CPU : ESS            (1 float)     — from pf.effective_sample_size()
@@ -47,37 +47,15 @@ from mppi import MPPI
 # Observation parsing helpers
 # --------------------------------------------------------------------------- #
 
-def _get_target(env) -> np.ndarray:
+def _get_target(obs: np.ndarray) -> np.ndarray:
     """
-    Retrieve the 2-D target position from the MuJoCo model.
+    Extract the 2-D goal position (x, y) from a Pusher-v5 observation.
 
-    Tries three methods in order, falling back gracefully across mujoco
-    binding versions and body/site naming conventions.
+    Pusher-v5 obs[20:23] is always the goal position (x, y, z).
+    The goal is fixed at [0.45, -0.05, -0.323] for all episodes.
+    We take obs[20:22] (x, y only; z is not needed by the planner).
     """
-    # Method 1: modern mujoco Python bindings — body named 'goal'
-    try:
-        pos = env.unwrapped.data.body("goal").xpos[:2].copy()
-        return pos.astype(np.float32)
-    except Exception:
-        pass
-
-    # Method 2: modern bindings — site named 'goal' (some Pusher XML variants)
-    try:
-        pos = env.unwrapped.data.site("goal").xpos[:2].copy()
-        return pos.astype(np.float32)
-    except Exception:
-        pass
-
-    # Method 3: older mujoco-py style — geom named 'goal'
-    try:
-        geom_id = env.unwrapped.model.geom_name2id("goal")
-        pos = env.unwrapped.data.geom_xpos[geom_id, :2].copy()
-        return pos.astype(np.float32)
-    except Exception:
-        pass
-
-    # Last resort: zero target — controller degrades gracefully
-    return np.zeros(2, dtype=np.float32)
+    return obs[20:22].astype(np.float32)
 
 
 # --------------------------------------------------------------------------- #
@@ -100,7 +78,9 @@ def run(config: Config, render: bool = False):
     """
     # ---- Environment -------------------------------------------------------
     render_mode = "human" if render else None
-    env = gym.make(config.env_name, render_mode=render_mode)
+    # Pass max_episode_steps to override the default 100-step truncation.
+    env = gym.make(config.env_name, render_mode=render_mode,
+                   max_episode_steps=config.max_steps)
 
     # ---- Components --------------------------------------------------------
     dynamics = PusherDynamics(dt=config.dt)
@@ -112,7 +92,8 @@ def run(config: Config, render: bool = False):
     obs, _info = env.reset()
     obs        = obs.astype(np.float32)
 
-    target = _get_target(env)
+    # Goal is fixed — read directly from obs[20:22] (always correct in v5)
+    target = _get_target(obs)
     dynamics.set_target(target)
     mppi.set_target(target)
     pf.initialize(obs)

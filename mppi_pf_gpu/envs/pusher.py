@@ -8,20 +8,19 @@ State layout (STATE_DIM = 18):
     [14:16] obj_pos  — 2-D object position (x, y)
     [16:18] obj_vel  — 2-D object velocity (vx, vy)
 
-Observation layout (OBS_DIM = 21, subset of Gym's 23-dim obs):
-    [0:7]   cos(q)
-    [7:14]  sin(q)
-    [14:21] qdot
-    (obj_pos and target_pos are handled separately)
+True Pusher-v5 Gymnasium observation (23-dim, float64):
+    [0:7]   q              — raw joint angles (rad)
+    [7:14]  qdot           — joint angular velocities (rad/s)
+    [14:17] fingertip_pos  — (x, y, z) in metres
+    [17:20] obj_pos        — (x, y, z) in metres
+    [20:23] goal_pos       — (x, y, z) FIXED: always (0.45, -0.05, -0.323)
 
-The full Gymnasium observation is 23-dim:
-    [0:7]   cos(q)      — 7
-    [7:14]  sin(q)      — 7
-    [14:21] qdot        — 7
-    [21:23] unused/dist — 2   (fingertip-to-object x/y in some versions)
-    … followed by object xyz (3) and goal xyz (3) in other layouts.
+PF observation (OBS_DIM = 16):
+    gym_obs_to_pf_obs() extracts [q(7), qdot(7), obj_x, obj_y]
+    = obs[0:14] + obs[17:19]. This maps 1-to-1 onto particle state[0:16],
+    so particle_to_obs() in the CUDA kernel is a direct state lookup.
 
-We store target_pos after episode reset and expose it via set_target().
+We store target_pos (x, y only) from obs[20:22] each episode reset.
 
 Notes
 -----
@@ -54,7 +53,9 @@ FRICTION       = 0.2        # object sliding friction coefficient
 
 STATE_DIM  = 18             # 7q + 7qdot + 2 obj_pos + 2 obj_vel
 ACTION_DIM = 7
-OBS_DIM    = 21             # cos(q) + sin(q) + qdot
+# PF uses [q(7), qdot(7), obj_x, obj_y]: a 16-dim direct slice of particle state.
+# gym_obs_to_pf_obs() maps the 23-dim gym obs into this vector.
+OBS_DIM    = 16             # q(7) + qdot(7) + obj_x + obj_y
 
 # Pusher-v4 action bounds (verified at runtime against env.action_space)
 ACTION_BOUND = 2.0
@@ -207,14 +208,27 @@ class PusherDynamics(AnalyticalDynamics):
 
     def obs_model(self, state: np.ndarray) -> np.ndarray:
         """
-        Maps internal state → predicted observation.
-        Returns 21-dim [cos(q), sin(q), qdot].
-        Does NOT include obj_pos / target — those are handled separately.
+        Maps internal particle state → 16-dim PF observation vector:
+          [q(7), qdot(7), obj_x, obj_y] = state[0:16]
+        Direct slice — no trig — mirrors particle_to_obs() in the CUDA kernel.
         """
-        state = np.asarray(state, dtype=np.float64)
-        q     = state[0:7]
-        qdot  = state[7:14]
-        return np.concatenate([np.cos(q), np.sin(q), qdot]).astype(np.float32)
+        return np.asarray(state, dtype=np.float32)[0:16]
+
+    def gym_obs_to_pf_obs(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Extract the 16-dim PF observation from a raw 23-dim Pusher-v5 gym obs.
+
+        Pusher-v5 obs layout:
+          [0:7]   q              raw joint angles
+          [7:14]  qdot           joint velocities
+          [14:17] fingertip_pos  (x, y, z) — skipped
+          [17:20] obj_pos        (x, y, z)
+          [20:23] goal_pos       (x, y, z) — skipped
+
+        Returns [q(7), qdot(7), obj_x, obj_y] = obs[0:14] + obs[17:19].
+        """
+        obs = np.asarray(obs, dtype=np.float32)
+        return np.concatenate([obs[0:14], obs[17:19]])
 
     # ------------------------------------------------------------------ #
     # Particle initialisation
@@ -222,40 +236,33 @@ class PusherDynamics(AnalyticalDynamics):
 
     def sample_initial_particles(self, obs: np.ndarray, N: int) -> np.ndarray:
         """
-        Bootstrap N particles from the first Gym observation.
+        Bootstrap N particles from the first Pusher-v5 observation.
 
-        Gym Pusher-v5 obs (23-dim):
-          [0:7]   cos(q)
-          [7:14]  sin(q)
-          [14:21] qdot
-          [21:23] fingertip-to-obj distances (ignored here)
-          *** Note: full obs layout varies slightly by gym version; we use
-              the standard 23-dim layout from gymnasium 0.29+ ***
-
-        We recover q via arctan2(sin(q), cos(q)) and use qdot directly.
-        Object position and velocity are set to zero + small noise (the true
-        obj_pos is embedded elsewhere in the obs in some versions — see
-        extract_obj_pos_from_obs in runner.py).
+        Pusher-v5 obs layout (23-dim):
+          [0:7]   q              raw joint angles (rad)
+          [7:14]  qdot           joint velocities (rad/s)
+          [14:17] fingertip_pos  (x, y, z)
+          [17:20] obj_pos        (x, y, z)  ← seeds particle obj_pos
+          [20:23] goal_pos       (x, y, z)
         """
         obs = np.asarray(obs, dtype=np.float64)
 
-        cos_q = obs[0:7]
-        sin_q = obs[7:14]
-        qdot  = obs[14:21]
-
-        q = np.arctan2(sin_q, cos_q)          # (7,) — exact recovery
+        q      = obs[0:7]    # raw joint angles (v5 layout: q at [0:7], NOT cos(q))
+        qdot   = obs[7:14]   # joint velocities
+        obj_xy = obs[17:19]  # object position x, y
 
         particles = np.zeros((N, STATE_DIM), dtype=np.float32)
 
-        # Tile the deterministic baseline across all N particles explicitly
+        # Tile deterministic baseline across all N particles
         particles[:, 0:7]  = np.tile(q.astype(np.float32),    (N, 1))
         particles[:, 7:14] = np.tile(qdot.astype(np.float32), (N, 1))
 
-        # Object pos/vel — small noise (PF will correct quickly)
-        particles[:, 14:16] = np.random.normal(0.0, 0.02, (N, 2)).astype(np.float32)
+        # Seed obj_pos from observed value — spread particles around it
+        particles[:, 14:16] = (np.tile(obj_xy.astype(np.float32), (N, 1))
+                                + np.random.normal(0.0, 0.02, (N, 2)).astype(np.float32))
         particles[:, 16:18] = np.random.normal(0.0, 0.01, (N, 2)).astype(np.float32)
 
-        # Add jitter to joint state so the initial cloud is not degenerate
+        # Small jitter so initial cloud is not degenerate
         particles[:, 0:7]  += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
         particles[:, 7:14] += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
 
@@ -317,7 +324,7 @@ _PUSHER_CUDA_CODE = r"""
 #define STATE_DIM       18
 #define ACTION_DIM      7
 #define NUM_JOINTS      7
-#define OBS_DIM         21      /* cos(q)+sin(q)+qdot used by PF weight kernel */
+#define OBS_DIM         16      /* q(7)+qdot(7)+obj_x+obj_y — PF weight kernel only */
 #define LINK_LENGTH     0.1f
 #define DAMPING         0.1f
 #define LINK_MASS       1.0f

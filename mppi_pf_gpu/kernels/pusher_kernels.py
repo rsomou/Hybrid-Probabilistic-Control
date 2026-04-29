@@ -158,44 +158,32 @@ void pf_propagate(
 # Computes log-likelihood of each particle given the current observation and
 # multiplies the existing weight (in log-sum-exp fashion via direct product).
 #
-# Observation model for Pusher:
-#   The Gymnasium Pusher-v4 observation is 23-dimensional:
-#     [0:7]   cos(q)
-#     [7:14]  sin(q)
-#     [14:21] qdot  (7 joint velocities)
-#     [21]    fingertip-to-object distance x (unused here)
-#     [22]    fingertip-to-object distance y (unused here)
-#   followed by object xyz (3) and goal xyz (3) — but env returns 23 total.
+# PF obs layout (OBS_DIM = 16) — built by gym_obs_to_pf_obs() from the
+# true Pusher-v5 23-dim gym obs:
+#   [0:7]   q      — raw joint angles   (gym obs[0:7])
+#   [7:14]  qdot   — joint velocities   (gym obs[7:14])
+#   [14]    obj_x  — object position x  (gym obs[17])
+#   [15]    obj_y  — object position y  (gym obs[18])
 #
-#   Internal state layout (STATE_DIM = 18):
-#     [0:7]   q      (joint angles)
-#     [7:14]  qdot   (joint velocities)
-#     [14:16] obj_pos  (x, y)
-#     [16:18] obj_vel  (vx, vy)
+# Particle state layout (STATE_DIM = 18):
+#   [0:7]   q        state[0:7]
+#   [7:14]  qdot     state[7:14]
+#   [14:16] obj_pos  state[14:16]  ← where particles differ → ESS < N
+#   [16:18] obj_vel  state[16:18]
 #
-#   We compare the joint angles (via cos/sin) and joint velocities.
+# KEY: predicted_obs[d] == state[d] for ALL d=0..15 — no trig, no branches.
+# Two noise scales:
+#   obs_noise_std     (tight, 0.005)  for joint dims d < 14
+#   obs_noise_std_obj (loose, 0.02)   for obj_pos dims d >= 14
 # --------------------------------------------------------------------------- #
 PF_WEIGHT_UPDATE_KERNEL = r"""
-/* Helper: extract the d-th element of the predicted observation for particle i.
-   obs layout mirrors Pusher-v4:
-     [0:7]   cos(q[j])
-     [7:14]  sin(q[j])
-     [14:21] qdot[j]
+/* Extract the d-th predicted observation for particle i.
+   PF obs is [q(0..6), qdot(7..13), obj_x(14), obj_y(15)].
+   particle state[0:16] == pf_obs[0:16], so this is a direct array read.
 */
 __device__ float particle_to_obs(const float* particles, int i, int d)
 {
-    // q lives at offsets [0..6], qdot at [7..13] of the state
-    const float* s = particles + i * STATE_DIM;
-    if (d < NUM_JOINTS) {
-        // cos(q[d])
-        return cosf(s[d]);
-    } else if (d < 2 * NUM_JOINTS) {
-        // sin(q[d - NUM_JOINTS])
-        return sinf(s[d - NUM_JOINTS]);
-    } else {
-        // qdot[d - 2*NUM_JOINTS]
-        return s[7 + (d - 2 * NUM_JOINTS)];
-    }
+    return particles[i * STATE_DIM + d];
 }
 
 extern "C" __global__
@@ -203,20 +191,25 @@ void pf_weight_update(
     const float* __restrict__ particles,   // (N, STATE_DIM)
     const float* __restrict__ observation, // (OBS_DIM,)
     float*       __restrict__ weights,     // (N,)  in/out (multiplied)
-    float obs_noise_std,
+    float obs_noise_std,       // tight std for joint dims  d < 14
+    float obs_noise_std_obj,   // looser std for obj_pos dims d >= 14
     int N
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    float inv_var      = 1.0f / (obs_noise_std * obs_noise_std);
-    float log_lik      = 0.0f;
+    float inv_var_joint = 1.0f / (obs_noise_std     * obs_noise_std);
+    float inv_var_obj   = 1.0f / (obs_noise_std_obj * obs_noise_std_obj);
+    float log_lik       = 0.0f;
 
-    // Compare predicted vs actual observation for the first OBS_DIM components
+    // Compare predicted vs actual observation for all OBS_DIM components
     for (int d = 0; d < OBS_DIM; d++) {
-        float pred = particle_to_obs(particles, i, d);
-        float diff = pred - observation[d];
-        log_lik   -= 0.5f * diff * diff * inv_var;
+        float pred    = particle_to_obs(particles, i, d);
+        float diff    = pred - observation[d];
+        // d < 2*NUM_JOINTS (=14): joint q+qdot use tight noise
+        // d >= 14:                 obj_pos uses looser noise
+        float inv_var = (d < 2 * NUM_JOINTS) ? inv_var_joint : inv_var_obj;
+        log_lik      -= 0.5f * diff * diff * inv_var;
     }
 
     weights[i] *= expf(log_lik);

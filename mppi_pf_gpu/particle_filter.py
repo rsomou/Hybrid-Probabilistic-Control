@@ -4,7 +4,7 @@ GPU-resident bootstrap particle filter.
 
 All arrays (particles, weights) live on the GPU for the entire episode.
 Only three things cross the bus per step:
-  CPU → GPU : observation vector (23 floats) via update()
+  CPU → GPU : pf_obs (16 floats: q, qdot, obj_xy) via update()
   CPU → GPU : action vector     (7 floats)  via propagate()
   GPU → CPU : weighted-mean state estimate  via estimate()
               ESS scalar                    via effective_sample_size()
@@ -122,7 +122,8 @@ class ParticleFilter:
 
         After multiplication weights are renormalised via GPUUtils.
         """
-        obs_gpu     = cp.asarray(obs[:self.dynamics.obs_dim], dtype=cp.float32)
+        # Convert raw 23-dim gym obs → 16-dim PF obs: [q, qdot, obj_x, obj_y]
+        obs_gpu     = cp.asarray(self.dynamics.gym_obs_to_pf_obs(obs), dtype=cp.float32)
         grid, block = self.gpu.get_grid_block(self.N)
 
         self._weight_kernel(
@@ -132,6 +133,7 @@ class ParticleFilter:
                 obs_gpu,
                 self.weights,
                 cp.float32(self.config.obs_noise_std),
+                cp.float32(self.config.obs_noise_std_obj),
                 np.int32(self.N),
             ),
         )
