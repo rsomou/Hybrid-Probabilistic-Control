@@ -1,6 +1,6 @@
 # Hybrid-Probabilistic-Control
 
-GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Implemented in Python/CuPy with raw CUDA kernels. Tested on MuJoCo **Pusher-v4** via Gymnasium.
+GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Implemented in Python/CuPy with raw CUDA kernels. Tested on MuJoCo **Pusher-v5** via Gymnasium.
 
 ---
 
@@ -103,9 +103,9 @@ Only ~35 floats cross the CPU-GPU bus per step (21 obs in, 7 action out, 1 ESS s
 
 ---
 
-## Pusher-v4 Environment
+## Pusher-v5 Environment
 
-Pusher-v4 is a MuJoCo environment from Gymnasium in which a 7-DOF planar robotic arm must push a small cylinder to a fixed goal position on a table. The arm is controlled by joint torques; the object moves only through contact with the fingertip. There is no gripper -- the task requires the controller to plan an approach trajectory, make contact, and push the object to the goal without being able to grasp it.
+Pusher-v5 is a MuJoCo environment from Gymnasium in which a 7-DOF planar robotic arm must push a small cylinder to a fixed goal position on a table. The arm is controlled by joint torques; the object moves only through contact with the fingertip. There is no gripper -- the task requires the controller to plan an approach trajectory, make contact, and push the object to the goal without being able to grasp it.
 
 **Gymnasium observation (23-dim):** `[q(7), qdot(7), fingertip_xyz(3), obj_xyz(3), goal_xyz(3)]`
 
@@ -138,7 +138,7 @@ Single `@dataclass` passed by reference to every component. No global state.
 
 | Field | Default | Description |
 |---|---|---|
-| `env_name` | `"Pusher-v4"` | Gymnasium environment ID |
+| `env_name` | `"Pusher-v5"` | Gymnasium environment ID |
 | `N` | `1000` | Particle filter particle count |
 | `process_noise_std` | `0.01` | Particle propagation noise std |
 | `obs_noise_std` | `0.05` | Observation likelihood noise std |

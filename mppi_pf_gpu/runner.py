@@ -1,6 +1,6 @@
 """
 runner.py
-CPU-side orchestration loop for MPPI + Particle Filter on Pusher-v4.
+CPU-side orchestration loop for MPPI + Particle Filter on Pusher-v5.
 
 Responsibilities
 ----------------
@@ -223,7 +223,7 @@ def run(config: Config, render: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="MPPI + Particle Filter on Pusher-v4"
+        description="MPPI + Particle Filter on Pusher-v5"
     )
     parser.add_argument("--K",        type=int,   default=1024,
                         help="MPPI trajectory samples")

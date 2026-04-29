@@ -1,6 +1,6 @@
 """
 kernels/pusher_kernels.py
-CUDA kernel source strings for the Pusher-v4 environment.
+CUDA kernel source strings for the Pusher-v5 environment.
 
 All strings here are concatenated with the dynamics device code from
 envs/pusher.py before being passed to cp.RawKernel for JIT compilation.

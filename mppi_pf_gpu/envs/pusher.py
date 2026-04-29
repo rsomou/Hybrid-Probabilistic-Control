@@ -1,6 +1,6 @@
 """
 envs/pusher.py
-Analytical dynamics for the Gymnasium Pusher-v4 environment.
+Analytical dynamics for the Gymnasium Pusher-v5 environment.
 
 State layout (STATE_DIM = 18):
     [0:7]   q        — joint angles (rad)
@@ -61,7 +61,7 @@ ACTION_BOUND = 2.0
 
 
 class PusherDynamics(AnalyticalDynamics):
-    """Analytical dynamics model for MuJoCo Pusher-v4."""
+    """Analytical dynamics model for MuJoCo Pusher-v5."""
 
     def __init__(self, dt: float = 0.05):
         self._dt = dt
@@ -224,7 +224,7 @@ class PusherDynamics(AnalyticalDynamics):
         """
         Bootstrap N particles from the first Gym observation.
 
-        Gym Pusher-v4 obs (23-dim):
+        Gym Pusher-v5 obs (23-dim):
           [0:7]   cos(q)
           [7:14]  sin(q)
           [14:21] qdot
@@ -310,7 +310,7 @@ class PusherDynamics(AnalyticalDynamics):
 # --------------------------------------------------------------------------- #
 _PUSHER_CUDA_CODE = r"""
 /* =========================================================
-   Pusher-v4 CUDA device code
+   Pusher-v5 CUDA device code
    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2)] = 18
    ========================================================= */
 
