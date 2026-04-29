@@ -2,8 +2,6 @@
 
 GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Implemented in Python/CuPy with raw CUDA kernels. Tested on MuJoCo **Pusher-v4** via Gymnasium.
 
-CPU orchestration is cleanly separated from GPU computation so a deadline-aware adaptive scheduler can be inserted without modifying any kernel code.
-
 ---
 
 ## Repository Structure
@@ -42,11 +40,11 @@ Each step has three stages:
 
 **(1) Propagation** -- draw each particle forward through the dynamics (parallel, one thread per particle):
 
-$$s_t^{(i)} \sim p(s_t \mid s_{t-1}^{(i)},\, a_{t-1}) = f(s_{t-1}^{(i)}, a_{t-1}) + \mathcal{N}(0, \sigma_p^2 I)$$
+$$s_t^{(i)} \sim p(s_t \mid s_{t-1}^{(i)}, a_{t-1}) = f(s_{t-1}^{(i)}, a_{t-1}) + \mathcal{N}(0, \sigma_p^2 I)$$
 
 **(2) Weighting** -- multiply each particle's weight by its observation likelihood (parallel, one thread per particle):
 
-$$w_i \propto w_i \cdot p(o_t \mid s_t^{(i)}) = w_i \cdot \exp\!\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
+$$w_i \propto w_i \cdot p(o_t \mid s_t^{(i)}) = w_i \cdot \exp\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
 
 Weights are renormalised to sum to one.
 
@@ -66,11 +64,11 @@ $$\varepsilon^{(k)} \sim \mathcal{N}(0, \sigma^2 I)^H, \quad k = 1, \ldots, K$$
 
 **(4)** Roll each candidate out through the dynamics and accumulate cost (parallel, one GPU thread per trajectory):
 
-$$S_k = \sum_{t=0}^{H-1} c(s_t^{(k)},\, u_t^{(k)}), \qquad s_{t+1}^{(k)} = f(s_t^{(k)},\, u_t^{(k)})$$
+$$S_k = \sum_{t=0}^{H-1} c(s_t^{(k)}, u_t^{(k)}), \qquad s_{t+1}^{(k)} = f(s_t^{(k)}, u_t^{(k)})$$
 
 **(5)** Compute importance weights. Subtracting $S_\min$ before exponentiation prevents overflow and is mathematically neutral (it cancels in the normalisation):
 
-$$h_k = \frac{\exp\!\left(-(S_k - S_\min)/\lambda\right)}{\sum_j \exp\!\left(-(S_j - S_\min)/\lambda\right)}$$
+$$h_k = \frac{\exp\left(-(S_k - S_\min)/\lambda\right)}{\sum_j \exp\left(-(S_j - S_\min)/\lambda\right)}$$
 
 Temperature $\lambda$ controls selectivity: $\lambda \to 0$ concentrates weight on the minimum-cost trajectory; $\lambda \to \infty$ averages all trajectories equally.
 
@@ -107,21 +105,29 @@ Only ~35 floats cross the CPU-GPU bus per step (21 obs in, 7 action out, 1 ESS s
 
 ## Pusher-v4 Environment
 
-**Internal state (18-dim):** `[q(7), qdot(7), obj_pos(2), obj_vel(2)]`
+Pusher-v4 is a MuJoCo environment from Gymnasium in which a 7-DOF planar robotic arm must push a small cylinder to a fixed goal position on a table. The arm is controlled by joint torques; the object moves only through contact with the fingertip. There is no gripper -- the task requires the controller to plan an approach trajectory, make contact, and push the object to the goal without being able to grasp it.
 
-**Dynamics:** Diagonal mass-matrix approximation with semi-implicit Euler integration:
+**Gymnasium observation (23-dim):** `[q(7), qdot(7), fingertip_xyz(3), obj_xyz(3), goal_xyz(3)]`
 
-$$\ddot{q}_i = (\tau_i - d \cdot \dot{q}_i) / m_i, \qquad \dot{q}^+ = \dot{q} + \ddot{q}\,\Delta t, \qquad q^+ = q + \dot{q}^+\,\Delta t$$
+The raw gym observation is a flattened vector of joint angles, joint velocities, and 3-D Cartesian positions of the fingertip, object, and goal. It does not include object velocity, which the particle filter must implicitly track through the latent state.
 
-with $d = 0.1$, $m_i = 1.0$, $\Delta t = 0.05$.
+**Internal state tracked by the particle filter (18-dim):** `[q(7), qdot(7), obj_pos_2d(2), obj_vel_2d(2)]`
 
-**Contact model:** Fingertip position is computed via planar forward kinematics. If the fingertip is within `CONTACT_RADIUS = 0.06 m` of the object, a push impulse proportional to the contact-normal component of the fingertip velocity is applied to the object.
+The object is constrained to the table plane, so its 3-D position reduces to 2-D. Object velocity is not directly observable but is needed to integrate the contact dynamics, so it is maintained as part of the latent state.
+
+**Dynamics (planning model):** The real MuJoCo simulator uses a full coupled inertia matrix. For GPU parallel rollouts, a diagonal mass-matrix approximation is used instead, which keeps each joint independent and avoids an $O(n^3)$ matrix solve per step:
+
+$$\ddot{q}_i = (\tau_i - d \cdot \dot{q}_i) / m_i, \qquad \dot{q}^+ = \dot{q} + \ddot{q} \, \Delta t, \qquad q^+ = q + \dot{q}^+ \, \Delta t$$
+
+with damping $d = 0.1$, mass $m_i = 1.0$ per joint, and $\Delta t = 0.05$ s (semi-implicit Euler).
+
+**Contact model:** Forward kinematics computes the fingertip position as a sum of planar link vectors. If the fingertip is within `CONTACT_RADIUS = 0.06 m` of the object, a push impulse proportional to the contact-normal component of the fingertip velocity is applied to the object. The contact normal is the unit vector from the object center to the fingertip.
 
 **Running cost:**
 
-$$c(s, a) = 1.0\,\|\text{tip} - \text{obj}\| + 5.0\,\|\text{obj} - \text{target}\| + 0.1\,\|a\|^2$$
+$$c(s, a) = 1.0 \|\text{tip} - \text{obj}\| + 5.0 \|\text{obj} - \text{goal}\| + 0.1 \|a\|^2$$
 
-The CUDA version in `kernels/pusher_kernels.py` uses `sinf`/`cosf`/`sqrtf` and must remain numerically identical to the numpy version in `envs/pusher.py`.
+The first term encourages the arm to stay near the object; the second penalises object distance from the goal (weighted higher to prioritise task completion); the third penalises large torques. The CUDA version in `kernels/pusher_kernels.py` uses `sinf`/`cosf`/`sqrtf` and must remain numerically identical to the numpy version in `envs/pusher.py`.
 
 ---
 
@@ -279,19 +285,7 @@ python runner.py --K 64 --N 200 --H 10
 python runner.py --K 4096 --deadline 30.0
 ```
 
-### Output
-
-```
-Step    0 | R= -3.142 | T= 12.34ms (GPU= 9.21 ENV= 3.13) | ESS=  923/1000 | K=1024
-...
-============================================================
-  Total reward  : -287.451
-  Steps         : 300
-  Avg step time : 13.02 ms  (GPU=9.87  ENV=3.15)
-  Deadline hits : 297/300 (99.0%  <= 50 ms)
-============================================================
-Timing log saved -> timing_log.npy
-```
+Per-step timing is printed to stdout when `--no-timing` is not set. After the episode, `timing_log.npy` is written to the working directory and can be loaded for offline analysis:
 
 ```python
 import numpy as np
