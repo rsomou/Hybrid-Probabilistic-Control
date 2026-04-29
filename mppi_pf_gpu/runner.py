@@ -11,13 +11,12 @@ Responsibilities
 
 Timing design
 -------------
-  t0  ──── GPU work begins ─────────────────────── t1
-  t1  ──── env.step() ──────────────────────── t2
-  t2  ──── pf.propagate() (prior update) ──── t3
+  t0  ──── GPU work begins (inject + propagate + update + MPPI) ──── t1
+  t1  ──── env.step() ──────────────────────────────────────── t2
 
   T_gpu_ms = (t1 - t0) * 1e3   (includes explicit Device.synchronize())
   T_env_ms = (t2 - t1) * 1e3
-  T_total  = (t3 - t0) * 1e3
+  T_total  = (t2 - t0) * 1e3
 
 This matches the data format the future deadline-aware scheduler expects.
 
@@ -100,31 +99,71 @@ def run(config: Config, render: bool = False):
 
     total_reward = 0.0
     timing_log   = []
+    prev_action  = None           # no prior action on the first step
 
     # ---- Control loop ------------------------------------------------------
     for t in range(config.max_steps):
         step_start = time.perf_counter()
 
         # ========================= GPU WORK =================================
-        # 1. Weight update: multiply particle weights by obs likelihood
+        #
+        # Key insight — observation injection:
+        #   The approximate dynamics model (diagonal mass, planar FK) drifts
+        #   from MuJoCo's real arm state over multiple steps.  After a few
+        #   steps ALL particles' q/qdot predictions are equally wrong, so
+        #   the weight update can't distinguish particles with different
+        #   object positions — the contact signal is lost in model error.
+        #
+        #   Fix: every step we (a) inject the true q/qdot into all particles,
+        #   (b) propagate ONE step with the action just applied, then
+        #   (c) compare that one-step prediction against the new obs.
+        #   Because every particle starts from the SAME true arm state, the
+        #   only source of prediction difference is their object-position
+        #   hypothesis and the resulting contact forces.  This makes the PF
+        #   genuinely functional.
+        #
+        # Step order (after step 0):
+        #   1. inject obs_{t} → overwrite q/qdot in all particles
+        #   2. propagate with prev_action → one-step prediction
+        #      (differs per particle only through contact with their obj_pos)
+        #   3. weight update comparing prediction against obs_{t}
+        #   4. ESS + adaptive resampling
+        #   5. sample K states for MPPI
+        #   6. MPPI → action_t
+        #
+        # On step 0 we skip inject+propagate because particles were just
+        # initialised from the first obs and there is no prior action.
+
+        if prev_action is not None:
+            # 1. Inject the PREVIOUS observation's q/qdot into particles
+            #    so propagation starts from the true arm state.
+            pf.inject_observation(prev_obs)
+
+            # 2. Propagate one step with prev_action.  Each particle now
+            #    predicts what q/qdot should be at this step, given its
+            #    own obj_pos hypothesis and the contact model.
+            pf.propagate(prev_action)
+
+        # 3. Weight update: compare predicted q/qdot against actual obs
         pf.update(obs)
 
-        # 2. ESS must be computed BEFORE resample() — resample resets all
+        # 4. ESS must be computed BEFORE resample() — resample resets all
         #    weights to 1/N, which would always give ESS == N and make the
         #    metric useless for the future scheduler.
         ess = pf.effective_sample_size()
 
-        # 3. Adaptive resampling: only resample when diversity falls below
-        #    the threshold.  Always resampling every step destroys diversity
-        #    once the cloud collapses — adaptive resampling lets the PF
-        #    recover naturally via the process noise.
+        # 5. Adaptive resampling: only resample when diversity falls below
+        #    the threshold.
         if ess < config.resample_threshold * config.N:
             pf.resample()
 
-        # 4. Sample K initial states from belief for MPPI rollouts
+        # 6. Sample K initial states from belief for MPPI rollouts.
+        #    Before sampling, inject the CURRENT true q/qdot so MPPI
+        #    rollouts start from the real arm configuration.
+        pf.inject_observation(obs)
         initial_states = pf.sample(mppi.K)          # (K, state_dim) on GPU
 
-        # 5. MPPI planning step — returns next action on CPU
+        # 7. MPPI planning step — returns next action on CPU
         action, mppi_timing = mppi.compute_action(initial_states)
 
         # Flush all pending GPU kernels before timestamping
@@ -133,13 +172,12 @@ def run(config: Config, render: bool = False):
         t_gpu_end = time.perf_counter()
 
         # ========================= CPU / ENV WORK ===========================
+        prev_obs    = obs                           # save for next step's injection
+        prev_action = action                        # save for next step's propagation
+
         obs, reward, terminated, truncated, _info = env.step(action)
         obs = obs.astype(np.float32)
         t_env_end = time.perf_counter()
-
-        # 6. Propagate particles forward with the action just applied
-        #    (prior update — runs asynchronously before next GPU sync)
-        pf.propagate(action)
         # ========================= END CPU / ENV WORK =======================
 
         total_reward += reward

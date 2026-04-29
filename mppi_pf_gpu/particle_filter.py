@@ -3,11 +3,16 @@ particle_filter.py
 GPU-resident bootstrap particle filter.
 
 All arrays (particles, weights) live on the GPU for the entire episode.
-Only three things cross the bus per step:
-  CPU → GPU : pf_obs (14 floats: q, qdot) via update()  — obj_pos hidden
+Per-step CPU-GPU bus crossings:
+  CPU → GPU : pf_obs (14 floats: q, qdot) via inject_observation() + update()
   CPU → GPU : action vector     (7 floats)  via propagate()
   GPU → CPU : weighted-mean state estimate  via estimate()
               ESS scalar                    via effective_sample_size()
+
+The inject_observation() method overwrites particles' q/qdot with the true
+observed values each step.  This prevents the approximate dynamics model
+from drifting and ensures the one-step contact signal is the dominant
+discriminator for the weight update.
 
 Kernel compilation happens once in __init__ — not per step.
 
@@ -72,6 +77,42 @@ class ParticleFilter:
         particles_cpu   = self.dynamics.sample_initial_particles(obs, self.N)
         self.particles  = cp.asarray(particles_cpu, dtype=cp.float32)
         self.weights    = cp.ones(self.N, dtype=cp.float32) / self.N
+
+    # ------------------------------------------------------------------ #
+    # Observation injection (Rao-Blackwellisation of observable dims)
+    # ------------------------------------------------------------------ #
+
+    def inject_observation(self, obs: np.ndarray):
+        """
+        Overwrite every particle's q and qdot with the true observed values
+        (plus small jitter to avoid degeneracy).
+
+        WHY: The approximate dynamics model (diagonal mass, planar FK) drifts
+        from MuJoCo's true arm state over multiple steps.  After a few steps
+        ALL particles' q/qdot are equally wrong, so the likelihood can't
+        discriminate between different object-position hypotheses — the
+        contact signal is drowned out by model error.
+
+        By injecting the true arm state every step, each particle starts
+        its NEXT dynamics propagation from the real arm configuration.
+        The only thing that differs between particles is their hidden
+        state (obj_pos, obj_vel).  This means the one-step contact
+        perturbation becomes the dominant signal in the weight update,
+        making the PF genuinely functional.
+
+        Parameters
+        ----------
+        obs : (23,) numpy array — raw Pusher-v5 gym observation
+        """
+        pf_obs  = self.dynamics.gym_obs_to_pf_obs(obs)       # (14,) q + qdot
+        obs_gpu = cp.asarray(pf_obs, dtype=cp.float32)       # → GPU
+
+        # Broadcast observed q/qdot to all N particles, add tiny jitter
+        jitter = cp.random.normal(
+            0.0, self.config.inject_noise_std,
+            (self.N, 14), dtype=cp.float32,
+        )
+        self.particles[:, 0:14] = obs_gpu[None, :] + jitter
 
     # ------------------------------------------------------------------ #
     # Propagation (prior update)
