@@ -226,8 +226,8 @@ def run(config: Config, render: bool = False):
                 f"K={mppi.K}"
             )
 
-        # ---- Diagnostic output every 20 steps ----------------------------
-        if t % 20 == 0:
+        # ---- Diagnostic output every 10 steps ----------------------------
+        if t % 10 == 0:
             q_now        = obs[0:7]
             real_tip     = obs[14:17]                        # MuJoCo fingertip xyz
             real_obj     = obs[17:20]                        # MuJoCo object xyz
