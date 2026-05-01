@@ -148,10 +148,19 @@ void pf_propagate(
     f_pusher(state, act, dt);
 
     // Write back with per-component additive process noise:
-    //   joint dims (d < 2*NUM_JOINTS = 14): use tight process_noise_std
-    //   object-state dims (d >= 14):        use loose process_noise_std_obj
+    //   joint dims  (d < 14):  process_noise_std  (0 — injected each step)
+    //   obj_pos     (d 14-15): process_noise_std_obj  (exploration noise)
+    //   obj_vel     (d 16-17): 0  (derived from contact dynamics)
+    //   tip_pos     (d 18-19): 0  (derived deterministically from FK)
     for (int d = 0; d < STATE_DIM; d++) {
-        float ns = (d < 2 * NUM_JOINTS) ? process_noise_std : process_noise_std_obj;
+        float ns;
+        if (d < 2 * NUM_JOINTS) {
+            ns = process_noise_std;
+        } else if (d < 2 * NUM_JOINTS + 2) {
+            ns = process_noise_std_obj;   // obj_pos only
+        } else {
+            ns = 0.0f;                    // obj_vel, tip_pos: deterministic
+        }
         particles[i * STATE_DIM + d] = state[d] + ns * noise[i * STATE_DIM + d];
     }
 }
@@ -159,17 +168,22 @@ void pf_propagate(
 
 # --------------------------------------------------------------------------- #
 # Particle Filter weight-update kernel
-# Computes log-likelihood of each particle given the current observation and
-# multiplies the existing weight (in log-sum-exp fashion via direct product).
+# Computes log-likelihood of each particle given the current observation.
+#
+# Rao-Blackwellisation: q/qdot are INJECTED each step, so all particles
+# share identical joint state (+ tiny jitter).  Including these dims in
+# the likelihood creates pure noise that swamps the obj_pos signal and
+# triggers pathological resampling (ESS collapses to 1-4).
+# Only the HIDDEN dimensions (obj_pos) should appear in the likelihood.
 #
 # PF obs layout (OBS_DIM = 16):
-#   [0:7]   q        — raw joint angles   (gym obs[0:7])
-#   [7:14]  qdot     — joint velocities   (gym obs[7:14])
-#   [14:16] obj_pos  — object xy          (gym obs[17:19])
+#   [0:7]   q        — raw joint angles   (gym obs[0:7])   ← SKIP (injected)
+#   [7:14]  qdot     — joint velocities   (gym obs[7:14])  ← SKIP (injected)
+#   [14:16] obj_pos  — object xy          (gym obs[17:19]) ← USED
 #
 # Particle state layout (STATE_DIM = 20):
-#   [0:7]   q        state[0:7]   ← compared to obs[0:7]
-#   [7:14]  qdot     state[7:14]  ← compared to obs[7:14]
+#   [0:7]   q        state[0:7]   ← skip (injected)
+#   [7:14]  qdot     state[7:14]  ← skip (injected)
 #   [14:16] obj_pos  state[14:16] ← compared to obs[14:16]
 #   [16:18] obj_vel  state[16:18] ← not observed
 #   [18:20] tip_pos  state[18:20] ← not observed
@@ -200,18 +214,14 @@ void pf_weight_update(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    float inv_var_joint = 1.0f / (obs_noise_std * obs_noise_std);
     float inv_var_obj   = 1.0f / (obs_noise_std_obj * obs_noise_std_obj);
     float log_lik       = 0.0f;
 
-    // Joint dims: q and qdot (d = 0..13) — tight noise scale
-    for (int d = 0; d < 2 * NUM_JOINTS; d++) {
-        float pred = particle_to_obs(particles, i, d);
-        float diff = pred - observation[d];
-        log_lik   -= 0.5f * diff * diff * inv_var_joint;
-    }
+    // Skip q/qdot dims (d=0..13): they are Rao-Blackwellised (injected
+    // from observations), so all particles share the same joint state.
+    // Including them adds pure jitter noise → pathological ESS collapse.
 
-    // Object position dims (d = 14..15) — looser noise scale
+    // Object position dims (d = 14..15) — the only hidden-state signal
     for (int d = 2 * NUM_JOINTS; d < OBS_DIM; d++) {
         float pred = particle_to_obs(particles, i, d);
         float diff = pred - observation[d];
