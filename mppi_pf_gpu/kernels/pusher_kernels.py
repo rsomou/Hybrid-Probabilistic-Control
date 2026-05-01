@@ -218,7 +218,9 @@ void pf_weight_update(
         log_lik   -= 0.5f * diff * diff * inv_var_obj;
     }
 
-    weights[i] *= expf(log_lik);
+    // Store raw log-likelihood (NOT exp). Host code applies
+    // max-subtraction trick to avoid float32 underflow.
+    weights[i] = log_lik;
 }
 """
 

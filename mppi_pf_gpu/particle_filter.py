@@ -51,6 +51,7 @@ class ParticleFilter:
         # GPU-resident state (allocated at initialize())
         self.particles: cp.ndarray = None   # (N, state_dim) float32
         self.weights:   cp.ndarray = None   # (N,)           float32
+        self._log_liks: cp.ndarray = None   # (N,)           float32 — scratch for weight kernel
 
         # ---- Compile kernels once ----------------------------------------
         # Use RawModule so the source is compiled exactly once and both
@@ -77,6 +78,7 @@ class ParticleFilter:
         particles_cpu   = self.dynamics.sample_initial_particles(obs, self.N)
         self.particles  = cp.asarray(particles_cpu, dtype=cp.float32)
         self.weights    = cp.ones(self.N, dtype=cp.float32) / self.N
+        self._log_liks  = cp.zeros(self.N, dtype=cp.float32)
 
     # ------------------------------------------------------------------ #
     # Observation injection (Rao-Blackwellisation of observable dims)
@@ -178,17 +180,24 @@ class ParticleFilter:
         obs_gpu     = cp.asarray(self.dynamics.gym_obs_to_pf_obs(obs), dtype=cp.float32)
         grid, block = self.gpu.get_grid_block(self.N)
 
+        # Kernel writes raw log-likelihoods into _log_liks buffer
         self._weight_kernel(
             grid, block,
             (
                 self.particles,
                 obs_gpu,
-                self.weights,
+                self._log_liks,
                 cp.float32(self.config.obs_noise_std),
                 cp.float32(self.config.obs_noise_std_obj),
                 np.int32(self.N),
             ),
         )
+
+        # Numerically stable Bayesian update (max-subtraction trick).
+        # Subtracting max cancels the large systematic q/qdot term that
+        # is identical across all particles, preventing float32 underflow.
+        max_ll = cp.max(self._log_liks)
+        self.weights *= cp.exp(self._log_liks - max_ll)
 
         self.gpu.parallel_normalize(self.weights)
 
