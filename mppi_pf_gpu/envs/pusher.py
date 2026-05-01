@@ -340,10 +340,16 @@ class PusherDynamics(AnalyticalDynamics):
         particles[:, 7:14] = np.tile(qdot.astype(np.float32), (N, 1))
 
         # Object position: sample from Pusher-v5 initial prior in WORLD FRAME.
-        # MJCF body origin (0.45, -0.05) + slide offset U[-0.3,0] x U[-0.2,0.2]
-        #   x ~ Uniform(0.15, 0.45),  y ~ Uniform(-0.25, 0.15)
-        particles[:, 14] = np.random.uniform(0.15, 0.45, N).astype(np.float32)
-        particles[:, 15] = np.random.uniform(-0.25, 0.15, N).astype(np.float32)
+        # MJCF body origin (0.45, -0.05, -0.275).
+        # Joint ordering in pusher_v5.xml: obj_slidey (qpos[-4]) then
+        # obj_slidex (qpos[-3]).  reset_model assigns:
+        #   cylinder_pos[0] = U(-0.3, 0)   → obj_slidey → y offset
+        #   cylinder_pos[1] = U(-0.2, 0.2) → obj_slidex → x offset
+        # World-frame ranges:
+        #   x = 0.45 + U(-0.2, 0.2) → U(0.25, 0.65)
+        #   y = -0.05 + U(-0.3, 0)  → U(-0.35, -0.05)
+        particles[:, 14] = np.random.uniform(0.25, 0.65, N).astype(np.float32)
+        particles[:, 15] = np.random.uniform(-0.35, -0.05, N).astype(np.float32)
 
         # Object velocity: zero prior
         particles[:, 16:18] = 0.0
