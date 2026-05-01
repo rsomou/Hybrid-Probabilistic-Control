@@ -132,7 +132,7 @@ def run(config: Config, render: bool = False, record: bool = False):
     anal0    = dynamics._forward_kinematics(q0)
     print(f"  q0         = {np.array2string(q0, precision=3, separator=',')}")
     print(f"  real_tip0  = ({tip0[0]:+.3f}, {tip0[1]:+.3f}, {tip0[2]:+.3f})")
-    print(f"  anal_tip0  = ({anal0[0]:+.3f}, {anal0[1]:+.3f})")
+    print(f"  anal_tip0  = ({anal0[0]:+.3f}, {anal0[1]:+.3f}, {anal0[2]:+.3f})")
     print(f"  real_obj0  = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
     print(f"  goal       = ({goal0[0]:+.3f}, {goal0[1]:+.3f}, {goal0[2]:+.3f})")
     print(f"  target(2d) = ({target[0]:+.3f}, {target[1]:+.3f})")
@@ -282,7 +282,7 @@ def run(config: Config, render: bool = False, record: bool = False):
             q_now        = obs[0:7]
             real_tip     = obs[14:17]                        # MuJoCo fingertip xyz
             real_obj     = obs[17:20]                        # MuJoCo object xyz
-            anal_tip     = dynamics._forward_kinematics(q_now)  # our FK (x, y)
+            anal_tip     = dynamics._forward_kinematics(q_now)  # our FK (x, y, z)
             tip_err      = np.sqrt((anal_tip[0] - real_tip[0])**2
                                    + (anal_tip[1] - real_tip[1])**2)
             tip_obj_dist = np.sqrt((real_tip[0] - real_obj[0])**2

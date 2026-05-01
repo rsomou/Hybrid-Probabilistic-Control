@@ -58,6 +58,10 @@ FRICTION       = 0.2        # object sliding friction coefficient
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
+# --- Z-height incentive for lowering the fingertip to the table plane ---
+TABLE_Z        = -0.275     # z-height of the object on the table (from MJCF body pos)
+Z_COST_WEIGHT  = 5.0        # weight on (tip_z - TABLE_Z)^2 in running cost
+
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
 # Full 7-DOF FK uses JOINT_AXES, JOINT_OFFSETS, and this base.
@@ -316,14 +320,14 @@ class PusherDynamics(AnalyticalDynamics):
     @staticmethod
     def _forward_kinematics(q: np.ndarray):
         """
-        Compute fingertip (x, y) using full 7-DOF forward kinematics.
+        Compute fingertip (x, y, z) using full 7-DOF forward kinematics.
 
         Chains all 7 joint transforms using the same rotation matrices
         and link offsets as the RNEA implementation.
 
         Returns
         -------
-        tip_x, tip_y : float
+        tip_x, tip_y, tip_z : float
             Fingertip position in the world frame.
         """
         pos = ARM_BASE.copy()
@@ -331,7 +335,7 @@ class PusherDynamics(AnalyticalDynamics):
         for i in range(NUM_JOINTS):
             pos = pos + R_cum @ JOINT_OFFSETS[i]
             R_cum = R_cum @ _rotation_matrix(JOINT_AXES[i], q[i])
-        return float(pos[0]), float(pos[1])
+        return float(pos[0]), float(pos[1]), float(pos[2])
 
     @staticmethod
     def _planar_jacobian(q: np.ndarray):
@@ -432,7 +436,7 @@ class PusherDynamics(AnalyticalDynamics):
             obj_pos += obj_vel * dt_sub
 
             # ---- Update tip_pos via FK ------------------------------------
-            tip_x, tip_y = self._forward_kinematics(q)
+            tip_x, tip_y, _tip_z = self._forward_kinematics(q)
             tip_pos = np.array([tip_x, tip_y])
 
         # ---- Pack next state ------------------------------------------
@@ -451,7 +455,9 @@ class PusherDynamics(AnalyticalDynamics):
 
     def cost_numpy(self, state: np.ndarray, action: np.ndarray) -> float:
         """
-        Running cost matching the Pusher-v5 reward (negated for minimisation).
+        Running cost matching the Pusher-v5 reward (negated for minimisation),
+        plus a z-height penalty to encourage lowering the fingertip to the
+        table plane so actual contact can occur in the 3-D simulator.
 
         Pusher-v5 reward:
           reward_near = -0.5 * ||fingertip - obj_pos||
@@ -461,6 +467,7 @@ class PusherDynamics(AnalyticalDynamics):
         cost = -reward = 0.5 * ||fingertip - obj_pos||
                        + 1.0 * ||obj_pos   - target_pos||
                        + 0.1 * ||action||^2
+                       + Z_COST_WEIGHT * (tip_z - TABLE_Z)^2
         """
         state  = np.asarray(state, dtype=np.float64)
         action = np.asarray(action, dtype=np.float64)
@@ -472,9 +479,15 @@ class PusherDynamics(AnalyticalDynamics):
         dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
         action_cost     = float(np.dot(action, action))
 
+        # Z-height penalty: compute tip_z from FK and penalise deviation
+        # from the table plane so the planner drives the arm downward.
+        _tx, _ty, tip_z = self._forward_kinematics(state[0:7])
+        z_err = tip_z - TABLE_Z
+
         return (0.5 * dist_tip_obj
                 + 1.0 * dist_obj_target
-                + 0.1 * action_cost)
+                + 0.1 * action_cost
+                + Z_COST_WEIGHT * z_err * z_err)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -648,7 +661,9 @@ def _generate_cuda_code():
         "#define ACTION_BOUND    2.0f\n"
         "#define N_SUBSTEPS      5\n"
         "#define INNER_DT        0.01f\n"
-        f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n\n"
+        f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n"
+        f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
+        f"#define Z_COST_WEIGHT   {Z_COST_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -820,7 +835,7 @@ __device__ void chol_solve7(float* A, const float* b, float* x) {
 /*  Chains all joint transforms: T = prod_i translate(offset_i) *       */
 /*  rotate(axis_i, q_i).  Returns tip (x, y) in world frame.           */
 /* ================================================================== */
-__device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y) {
+__device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y, float* tip_z) {
     float pos[3] = {ARM_BASE_X, ARM_BASE_Y, ARM_BASE_Z};
     float R[9] = {1,0,0, 0,1,0, 0,0,1};  /* cumulative rotation, row-major */
 
@@ -844,6 +859,7 @@ __device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y) {
     }
     *tip_x = pos[0];
     *tip_y = pos[1];
+    *tip_z = pos[2];
 }
 
 /* ================================================================== */
@@ -968,12 +984,15 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         obj_pos[0] += obj_vel[0]*INNER_DT;
         obj_pos[1] += obj_vel[1]*INNER_DT;
 
-        forward_kinematics(q, &tip_pos[0], &tip_pos[1]);
+        float dummy_z;
+        forward_kinematics(q, &tip_pos[0], &tip_pos[1], &dummy_z);
     }
 }
 
 /* ================================================================== */
-/*  cost_pusher: running cost (unchanged from original)                */
+/*  cost_pusher: running cost with z-height penalty                     */
+/*  The z-height term encourages the planner to lower the fingertip    */
+/*  to the table plane so that real 3-D contact can occur.             */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target)
@@ -986,9 +1005,19 @@ __device__ float cost_pusher(const float* state, const float* action,
     float d2 = sqrtf(dx2*dx2+dy2*dy2);
     float act2=0.0f;
     for (int a=0;a<ACTION_DIM;a++) act2+=action[a]*action[a];
+
+    /* Z-height penalty: compute fingertip z via FK from joint angles
+       and penalise deviation from the table plane (TABLE_Z).  This is
+       the key signal that makes the planner lower the arm so that
+       real 3-D contact with the object is possible. */
+    float fk_x, fk_y, fk_z;
+    forward_kinematics(state, &fk_x, &fk_y, &fk_z);
+    float z_err = fk_z - TABLE_Z;
+
     // Matched to Pusher-v5 gym reward (negated for minimisation):
     //   reward = -0.5*||tip-obj|| - 1.0*||obj-goal|| - 0.1*||action||^2
-    return 0.5f*d1 + 1.0f*d2 + 0.1f*act2;
+    //   + z-height penalty to drive the arm to the correct height
+    return 0.5f*d1 + 1.0f*d2 + 0.1f*act2 + Z_COST_WEIGHT*z_err*z_err;
 }
 """
 
