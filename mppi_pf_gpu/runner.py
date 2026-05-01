@@ -36,7 +36,7 @@ import numpy as np
 import cupy as cp
 
 from config import Config
-from envs.pusher import PusherDynamics
+from envs.pusher import PusherDynamics, CONTACT_RADIUS
 from gpu_utils import GPUUtils
 from particle_filter import ParticleFilter
 from mppi import MPPI
@@ -100,6 +100,22 @@ def run(config: Config, render: bool = False):
     total_reward = 0.0
     timing_log   = []
     prev_action  = None           # no prior action on the first step
+
+    # ---- Initial diagnostics -----------------------------------------------
+    print(f"\n{'='*60}")
+    print(f"  INIT DIAG")
+    q0       = obs[0:7]
+    tip0     = obs[14:17]
+    obj0     = obs[17:20]
+    goal0    = obs[20:23]
+    anal0    = dynamics._forward_kinematics(q0)
+    print(f"  q0         = {np.array2string(q0, precision=3, separator=',')}")
+    print(f"  real_tip0  = ({tip0[0]:+.3f}, {tip0[1]:+.3f}, {tip0[2]:+.3f})")
+    print(f"  anal_tip0  = ({anal0[0]:+.3f}, {anal0[1]:+.3f})")
+    print(f"  real_obj0  = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
+    print(f"  goal       = ({goal0[0]:+.3f}, {goal0[1]:+.3f}, {goal0[2]:+.3f})")
+    print(f"  target(2d) = ({target[0]:+.3f}, {target[1]:+.3f})")
+    print(f"{'='*60}\n")
 
     # ---- Control loop ------------------------------------------------------
     for t in range(config.max_steps):
@@ -208,6 +224,52 @@ def run(config: Config, render: bool = False):
                 f"T={T_total_ms:6.2f}ms (GPU={T_gpu_ms:5.2f} ENV={T_env_ms:5.2f}) | "
                 f"ESS={ess:6.0f}/{config.N} | "
                 f"K={mppi.K}"
+            )
+
+        # ---- Diagnostic output every 20 steps ----------------------------
+        if t % 20 == 0:
+            q_now        = obs[0:7]
+            real_tip     = obs[14:17]                        # MuJoCo fingertip xyz
+            real_obj     = obs[17:20]                        # MuJoCo object xyz
+            anal_tip     = dynamics._forward_kinematics(q_now)  # our FK (x, y)
+            tip_err      = np.sqrt((anal_tip[0] - real_tip[0])**2
+                                   + (anal_tip[1] - real_tip[1])**2)
+            tip_obj_dist = np.sqrt((real_tip[0] - real_obj[0])**2
+                                   + (real_tip[1] - real_obj[1])**2)
+            anal_obj_dist = np.sqrt((anal_tip[0] - real_obj[0])**2
+                                    + (anal_tip[1] - real_obj[1])**2)
+
+            # Check how many particles have obj_pos within contact radius
+            # of the analytical fingertip
+            particles_cpu = cp.asnumpy(pf.particles)
+            p_obj = particles_cpu[:, 14:16]                  # (N, 2)
+            p_tip = np.array(anal_tip).reshape(1, 2)
+            p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
+            n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
+
+            # Particle obj_pos spread
+            obj_mean = p_obj.mean(axis=0)
+            obj_std  = p_obj.std(axis=0)
+
+            print(
+                f"  DIAG step {t}: "
+                f"real_tip=({real_tip[0]:+.3f},{real_tip[1]:+.3f},{real_tip[2]:+.3f}) "
+                f"anal_tip=({anal_tip[0]:+.3f},{anal_tip[1]:+.3f}) "
+                f"FK_err={tip_err:.4f}m"
+            )
+            print(
+                f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
+                f"tip→obj(real)={tip_obj_dist:.3f}m "
+                f"tip→obj(anal)={anal_obj_dist:.3f}m "
+                f"contact_r={CONTACT_RADIUS}"
+            )
+            print(
+                f"         particles: obj_mean=({obj_mean[0]:+.3f},{obj_mean[1]:+.3f}) "
+                f"obj_std=({obj_std[0]:.3f},{obj_std[1]:.3f}) "
+                f"n_in_contact={n_contact}/{config.N}"
+            )
+            print(
+                f"         action={np.array2string(action, precision=2, separator=',')}"
             )
 
         if terminated or truncated:
