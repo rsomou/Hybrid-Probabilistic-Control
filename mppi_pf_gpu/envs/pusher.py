@@ -472,9 +472,9 @@ class PusherDynamics(AnalyticalDynamics):
         dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
         action_cost     = float(np.dot(action, action))
 
-        return (5.0 * dist_tip_obj
+        return (0.5 * dist_tip_obj
                 + 1.0 * dist_obj_target
-                + 0.01 * action_cost)
+                + 0.1 * action_cost)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -986,10 +986,9 @@ __device__ float cost_pusher(const float* state, const float* action,
     float d2 = sqrtf(dx2*dx2+dy2*dy2);
     float act2=0.0f;
     for (int a=0;a<ACTION_DIM;a++) act2+=action[a]*action[a];
-    // Weights deliberately differ from the gym reward (0.5/1.0/0.1):
-    //   - 5.0 on tip-obj so the approach signal dominates action noise
-    //   - 0.01 on action penalty so exploration isn't suppressed
-    return 5.0f*d1 + 1.0f*d2 + 0.01f*act2;
+    // Matched to Pusher-v5 gym reward (negated for minimisation):
+    //   reward = -0.5*||tip-obj|| - 1.0*||obj-goal|| - 0.1*||action||^2
+    return 0.5f*d1 + 1.0f*d2 + 0.1f*act2;
 }
 """
 

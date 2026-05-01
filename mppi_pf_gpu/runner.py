@@ -33,6 +33,7 @@ import time
 from collections import deque
 
 import gymnasium as gym
+from gymnasium.wrappers import RecordVideo
 import numpy as np
 import cupy as cp
 
@@ -62,7 +63,7 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
 # Main control loop
 # --------------------------------------------------------------------------- #
 
-def run(config: Config, render: bool = False):
+def run(config: Config, render: bool = False, record: bool = False):
     """
     Execute one episode of Pusher-v5 with MPPI + Particle Filter.
 
@@ -70,6 +71,7 @@ def run(config: Config, render: bool = False):
     ----------
     config : Config
     render : bool — if True opens the MuJoCo viewer
+    record : bool — if True saves an MP4 video to ./videos/
 
     Returns
     -------
@@ -77,10 +79,19 @@ def run(config: Config, render: bool = False):
     timing_log   : list[dict]  — one entry per step
     """
     # ---- Environment -------------------------------------------------------
-    render_mode = "human" if render else None
+    if record:
+        render_mode = "rgb_array"
+    elif render:
+        render_mode = "human"
+    else:
+        render_mode = None
     # Pass max_episode_steps to override the default 100-step truncation.
     env = gym.make(config.env_name, render_mode=render_mode,
                    max_episode_steps=config.max_steps)
+    if record:
+        env = RecordVideo(env, video_folder="./videos",
+                          name_prefix="pusher_mppi",
+                          episode_trigger=lambda _: True)
 
     # ---- Components --------------------------------------------------------
     dynamics = PusherDynamics(dt=config.dt)
@@ -382,6 +393,8 @@ if __name__ == "__main__":
                         help="CUDA device ID")
     parser.add_argument("--render",   action="store_true",
                         help="Open MuJoCo viewer")
+    parser.add_argument("--record",   action="store_true",
+                        help="Record MP4 video to ./videos/")
     parser.add_argument("--no-timing", action="store_true",
                         help="Suppress per-step timing output")
     args = parser.parse_args()
@@ -398,4 +411,4 @@ if __name__ == "__main__":
         enable_timing  = not args.no_timing,
     )
 
-    run(cfg, render=args.render)
+    run(cfg, render=args.render, record=args.record)
