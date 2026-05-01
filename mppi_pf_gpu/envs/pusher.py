@@ -2,11 +2,17 @@
 envs/pusher.py
 Analytical dynamics for the Gymnasium Pusher-v5 environment.
 
-State layout (STATE_DIM = 18):
+State layout (STATE_DIM = 20):
     [0:7]   q        — joint angles (rad)
     [7:14]  qdot     — joint velocities (rad/s)
-    [14:16] obj_pos  — 2-D object position (x, y)
-    [16:18] obj_vel  — 2-D object velocity (vx, vy)
+    [14:16] obj_pos  — 2-D object position (x, y)       — HIDDEN from PF
+    [16:18] obj_vel  — 2-D object velocity (vx, vy)     — HIDDEN from PF
+    [18:20] tip_pos  — 2-D fingertip position (x, y)    — INJECTED from obs
+
+    tip_pos is the TRUE fingertip position from MuJoCo, injected each step
+    via inject_observation(). It is used for contact detection instead of
+    the approximate analytical FK.  During MPPI multi-step rollouts,
+    tip_pos is updated by the (approximate) analytical FK after each step.
 
 True Pusher-v5 Gymnasium observation (23-dim, float64):
     [0:7]   q              — raw joint angles (rad)
@@ -28,8 +34,9 @@ Notes
 * The simplified diagonal-mass-matrix arm dynamics are intentionally
   approximate. MuJoCo's coupled mass matrix governs the real simulation;
   this model exists solely for MPPI/PF planning.
-* CUDA code is functionally identical to the numpy code — verified by
-  `test_dynamics_parity()` in tests/test_pusher.py.
+* Contact detection uses the INJECTED true fingertip position (state[18:20])
+  rather than the analytical FK.  This is critical because the analytical
+  FK (a 2-link planar approximation of a 3D arm) has 0.1–0.7m error.
 """
 
 import numpy as np
@@ -53,29 +60,20 @@ FRICTION       = 0.2        # object sliding friction coefficient
 
 # --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) ---
 # The real arm is 3D, but operates mostly in the XY plane (gravity=0).
-# Joints 0 (shoulder_pan), 3 (elbow_flex), 5 (wrist_flex) control XY.
-# Joints 1,2,4,6 (lift/roll) mostly affect Z — we ignore them for 2D.
+# The Gymnasium obs "fingertip" (get_body_com("tips_arm")) is at the
+# WRIST body frame, NOT 0.1m past it.  Verified: at q=0 real tip =
+# (0.821, -0.6) = base + 0.5 + 0.321, confirming 2-link model.
 #
-# Body hierarchy offsets from the MJCF:
-#   shoulder_pan_link  at (0, -0.6, 0)   — base
-#   shoulder_lift_link at (0.1, 0, 0)    — small offset after pan
-#   upper_arm_link     geom to (0.4, 0, 0) — upper arm
-#   elbow_flex_link    at (0.4, 0, 0)    — elbow
-#   forearm_link       geom to (0.291, 0, 0), wrist at (0.321,0,0)
-#   wrist_flex_link    at (0.321, 0, 0)  — wrist
-#   fingertip          at (0.1, 0, 0)    — tip offset
-#
-# Effective 3-link chain in XY:
+# Effective 2-link chain in XY (used only for FK during MPPI rollouts):
 #   link 0: shoulder → elbow  = 0.1 + 0.4 = 0.5m  (rotated by q[0])
 #   link 1: elbow → wrist     = 0.321m             (rotated by q[0]+q[3])
-#   link 2: wrist → fingertip = 0.1m               (rotated by q[0]+q[3]+q[5])
 BASE_X         = 0.0
 BASE_Y         = -0.6
-EFF_LINK_LENGTHS = [0.5, 0.321, 0.1]     # metres
-EFF_JOINT_INDICES = [0, 3, 5]            # which q[] indices affect XY FK
-N_EFF_LINKS    = 3
+EFF_LINK_LENGTHS = [0.5, 0.321]          # metres
+EFF_JOINT_INDICES = [0, 3]               # which q[] indices affect XY FK
+N_EFF_LINKS    = 2
 
-STATE_DIM  = 18             # 7q + 7qdot + 2 obj_pos + 2 obj_vel
+STATE_DIM  = 20             # 7q + 7qdot + 2 obj_pos + 2 obj_vel + 2 tip_pos
 ACTION_DIM = 7
 # PARTIAL OBSERVABILITY: PF sees only [q(7), qdot(7)] — object position is hidden.
 # gym_obs_to_pf_obs() returns obs[0:14] only. The PF must infer obj_pos from
@@ -132,7 +130,7 @@ class PusherDynamics(AnalyticalDynamics):
         """
         Compute the 2×7 Jacobian mapping qdot → fingertip velocity in XY.
 
-        Only the 3 effective joints (0, 3, 5) have non-zero columns.
+        Only the effective joints have non-zero columns.
         Returns J_x, J_y as (7,) arrays (zero for non-effective joints).
         """
         J_x = np.zeros(NUM_JOINTS, dtype=np.float64)
@@ -167,8 +165,13 @@ class PusherDynamics(AnalyticalDynamics):
         """
         One semi-implicit Euler step on CPU.
 
-        state layout: [q(7), qdot(7), obj_pos(2), obj_vel(2)]
+        state layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)]
         action: (7,) joint torques
+
+        Contact uses state[18:20] (injected true fingertip position) rather
+        than the analytical FK.  This is critical because the FK is a 2-link
+        planar approximation of a 3D arm and can be off by 0.1–0.7m.
+        After integration, tip_pos is updated via FK for MPPI rollouts.
         """
         state   = np.asarray(state, dtype=np.float64)
         action  = np.clip(action, -ACTION_BOUND, ACTION_BOUND).astype(np.float64)
@@ -178,41 +181,35 @@ class PusherDynamics(AnalyticalDynamics):
         qdot    = state[7:14].copy()
         obj_pos = state[14:16].copy()
         obj_vel = state[16:18].copy()
+        tip_pos = state[18:20].copy()     # injected real fingertip xy
 
         # ---- Arm acceleration from applied torques --------------------
         tau     = action
         qddot   = (tau - DAMPING * qdot) / LINK_MASS   # shape (7,)
 
-        # ---- Forward kinematics & contact (BEFORE Euler integration) --
-        # Contact must be computed before integration so the reaction
-        # force can modify qddot.  This makes q_new/qdot_new depend on
-        # obj_pos — the key signal the particle filter uses to
-        # discriminate between object-position hypotheses.
-        tip_x, tip_y = self._forward_kinematics(q)
-
-        # Compute Jacobian (needed for velocity AND reaction torque)
+        # ---- Contact detection using REAL tip position ----------------
+        # tip_pos comes from obs[14:16] (injected each step), so contact
+        # is detected at the TRUE fingertip location.  The Jacobian is
+        # still approximate but only used for velocity and reaction torque.
         J_x, J_y = self._planar_jacobian(q)
-
         tip_vx = float(J_x @ qdot)
         tip_vy = float(J_y @ qdot)
 
-        diff    = obj_pos - np.array([tip_x, tip_y])
+        diff    = obj_pos - tip_pos
         dist    = np.linalg.norm(diff)
 
         if dist < CONTACT_RADIUS and dist > 1e-8:
-            push_dir    = diff / dist                    # unit vector tip→obj
+            push_dir    = diff / dist
             tip_vel     = np.array([tip_vx, tip_vy])
             v_component = max(0.0, float(tip_vel @ push_dir))
             push_force  = PUSH_STRENGTH * v_component
 
-            # Force on object (push away from fingertip)
             obj_vel += push_force * push_dir * dt
 
-            # Newton's 3rd law: reaction force on fingertip = −F
-            # Map to joint torques via Jacobian transpose: τ = J^T @ (−F)
+            # Newton's 3rd law: reaction on arm via J^T
             rx = -push_force * push_dir[0]
             ry = -push_force * push_dir[1]
-            reaction_torque = J_x * rx + J_y * ry       # (7,)
+            reaction_torque = J_x * rx + J_y * ry
             qddot += reaction_torque / LINK_MASS
 
         # ---- Semi-implicit Euler (with reaction force in qddot) -------
@@ -220,8 +217,11 @@ class PusherDynamics(AnalyticalDynamics):
         q_new    = q    + qdot_new * dt
 
         # ---- Object dynamics ------------------------------------------
-        obj_vel *= (1.0 - FRICTION * dt)                 # friction damping
+        obj_vel *= (1.0 - FRICTION * dt)
         obj_pos  = obj_pos + obj_vel * dt
+
+        # ---- Update tip_pos via FK (approximate, for MPPI rollouts) ---
+        tip_new_x, tip_new_y = self._forward_kinematics(q_new)
 
         # ---- Pack next state ------------------------------------------
         next_state = np.empty(STATE_DIM, dtype=np.float64)
@@ -229,6 +229,8 @@ class PusherDynamics(AnalyticalDynamics):
         next_state[7:14]  = qdot_new
         next_state[14:16] = obj_pos
         next_state[16:18] = obj_vel
+        next_state[18]    = tip_new_x
+        next_state[19]    = tip_new_y
         return next_state
 
     # ------------------------------------------------------------------ #
@@ -251,11 +253,8 @@ class PusherDynamics(AnalyticalDynamics):
         state  = np.asarray(state, dtype=np.float64)
         action = np.asarray(action, dtype=np.float64)
 
-        q       = state[0:7]
         obj_pos = state[14:16]
-
-        tip_x, tip_y = self._forward_kinematics(q)
-        tip_pos      = np.array([tip_x, tip_y])
+        tip_pos = state[18:20]           # use stored tip position
 
         dist_tip_obj    = np.linalg.norm(tip_pos - obj_pos)
         dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
@@ -322,14 +321,15 @@ class PusherDynamics(AnalyticalDynamics):
         Pusher-v5 obs layout (23-dim):
           [0:7]   q              raw joint angles (rad)      → used
           [7:14]  qdot           joint velocities (rad/s)    → used
-          [14:17] fingertip_pos  (x, y, z)                   → skipped
+          [14:17] fingertip_pos  (x, y, z)                   → tip_pos
           [17:20] obj_pos        (x, y, z)                   → HIDDEN
           [20:23] goal_pos       (x, y, z)                   → skipped
         """
         obs = np.asarray(obs, dtype=np.float64)
 
-        q    = obs[0:7]    # raw joint angles (v5: q at [0:7], NOT cos(q))
-        qdot = obs[7:14]   # joint velocities
+        q      = obs[0:7]
+        qdot   = obs[7:14]
+        tip_xy = obs[14:16]   # real fingertip x, y
 
         particles = np.zeros((N, STATE_DIM), dtype=np.float32)
 
@@ -342,8 +342,12 @@ class PusherDynamics(AnalyticalDynamics):
         particles[:, 14] = np.random.uniform(-0.3, 0.0, N).astype(np.float32)
         particles[:, 15] = np.random.uniform(-0.2, 0.2, N).astype(np.float32)
 
-        # Object velocity: zero prior (Pusher-v5 starts with zero obj velocity)
+        # Object velocity: zero prior
         particles[:, 16:18] = 0.0
+
+        # Fingertip position: set from real observation
+        particles[:, 18] = tip_xy[0]
+        particles[:, 19] = tip_xy[1]
 
         # Small jitter on joint dims so initial cloud is not degenerate
         particles[:, 0:7]  += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
@@ -401,10 +405,11 @@ class PusherDynamics(AnalyticalDynamics):
 _PUSHER_CUDA_CODE = r"""
 /* =========================================================
    Pusher-v5 CUDA device code
-   State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2)] = 18
+   State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)] = 20
+   tip_pos = injected real fingertip position; used for contact detection
    ========================================================= */
 
-#define STATE_DIM       18
+#define STATE_DIM       20
 #define ACTION_DIM      7
 #define NUM_JOINTS      7
 #define OBS_DIM         14      /* q(7)+qdot(7) only — obj_pos withheld (partial obs) */
@@ -415,13 +420,16 @@ _PUSHER_CUDA_CODE = r"""
 #define FRICTION        0.2f
 #define ACTION_BOUND    2.0f
 
-/* --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) --- */
-/* Only joints 0, 3, 5 affect XY.  Others are lift/roll (mostly Z). */
+/* --- Effective 2-link planar FK (from MuJoCo Pusher-v5 MJCF) ---
+   "fingertip" obs is at the wrist body frame, not 0.1m past it.
+   Verified: at q=0, real_tip=(0.821,-0.6) = base + 0.5 + 0.321.
+   Only used for updating tip_pos during MPPI multi-step rollouts;
+   contact detection uses the injected real tip_pos (state[18:20]). */
 #define BASE_X          0.0f
 #define BASE_Y         -0.6f
-#define N_EFF_LINKS     3
-__device__ const int   EFF_JOINT_IDX[3] = {0, 3, 5};
-__device__ const float EFF_LINK_LEN[3]  = {0.5f, 0.321f, 0.1f};
+#define N_EFF_LINKS     2
+__device__ const int   EFF_JOINT_IDX[2] = {0, 3};
+__device__ const float EFF_LINK_LEN[2]  = {0.5f, 0.321f};
 
 /* ------------------------------------------------------------------ */
 /* Forward kinematics: 3-link effective planar chain                    */
@@ -492,6 +500,7 @@ __device__ void f_pusher(float* state, const float* action, float dt)
     float* qdot    = state + 7;      /* [7..13]  */
     float* obj_pos = state + 14;     /* [14..15] */
     float* obj_vel = state + 16;     /* [16..17] */
+    float* tip_pos = state + 18;     /* [18..19] injected real tip xy */
 
     /* ---- Arm acceleration from applied torques ---- */
     float qddot[NUM_JOINTS];
@@ -500,18 +509,14 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         qddot[j]  = (tau - DAMPING * qdot[j]) / LINK_MASS;
     }
 
-    /* ---- FK + Jacobian + contact (BEFORE integration) ---- */
-    float tip_x, tip_y;
-    forward_kinematics(q, &tip_x, &tip_y);
-
-    /* Compute Jacobian and fingertip velocity */
+    /* ---- Contact using REAL tip position (state[18:20]) ---- */
+    /* Jacobian is still approximate — only used for velocity + reaction */
     float Jx[NUM_JOINTS], Jy[NUM_JOINTS];
     float tip_vx, tip_vy;
     planar_jacobian(q, qdot, Jx, Jy, &tip_vx, &tip_vy);
 
-    /* Contact check */
-    float dx   = obj_pos[0] - tip_x;
-    float dy   = obj_pos[1] - tip_y;
+    float dx   = obj_pos[0] - tip_pos[0];
+    float dy   = obj_pos[1] - tip_pos[1];
     float dist = sqrtf(dx * dx + dy * dy);
 
     if (dist < CONTACT_RADIUS && dist > 1e-8f) {
@@ -546,6 +551,9 @@ __device__ void f_pusher(float* state, const float* action, float dt)
     obj_vel[1] *= one_minus_fric;
     obj_pos[0] += obj_vel[0] * dt;
     obj_pos[1] += obj_vel[1] * dt;
+
+    /* ---- Update tip_pos via FK (approximate, for MPPI rollouts) ---- */
+    forward_kinematics(q, &tip_pos[0], &tip_pos[1]);
 }
 
 /* ------------------------------------------------------------------ */
@@ -560,15 +568,12 @@ __device__ void f_pusher(float* state, const float* action, float dt)
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target)
 {
-    const float* q       = state;
     const float* obj_pos = state + 14;
-
-    float tip_x, tip_y;
-    forward_kinematics(q, &tip_x, &tip_y);
+    const float* tip_pos = state + 18;   /* use stored tip position */
 
     /* reward_near: ||fingertip - obj_pos|| */
-    float dx1  = tip_x - obj_pos[0];
-    float dy1  = tip_y - obj_pos[1];
+    float dx1  = tip_pos[0] - obj_pos[0];
+    float dy1  = tip_pos[1] - obj_pos[1];
     float d1   = sqrtf(dx1 * dx1 + dy1 * dy1);
 
     /* reward_dist: ||obj_pos - target_pos|| */

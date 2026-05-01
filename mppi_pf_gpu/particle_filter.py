@@ -114,6 +114,12 @@ class ParticleFilter:
         )
         self.particles[:, 0:14] = obs_gpu[None, :] + jitter
 
+        # Also inject the real fingertip position (obs[14:16]) into
+        # state[18:20].  This is critical: contact detection uses
+        # state[18:20] instead of the (broken) analytical FK.
+        tip_xy = cp.asarray(obs[14:16].astype(np.float32), dtype=cp.float32)
+        self.particles[:, 18:20] = tip_xy[None, :]
+
     # ------------------------------------------------------------------ #
     # Propagation (prior update)
     # ------------------------------------------------------------------ #

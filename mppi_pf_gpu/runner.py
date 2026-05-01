@@ -240,10 +240,10 @@ def run(config: Config, render: bool = False):
                                     + (anal_tip[1] - real_obj[1])**2)
 
             # Check how many particles have obj_pos within contact radius
-            # of the analytical fingertip
+            # of the INJECTED tip position (state[18:20])
             particles_cpu = cp.asnumpy(pf.particles)
             p_obj = particles_cpu[:, 14:16]                  # (N, 2)
-            p_tip = np.array(anal_tip).reshape(1, 2)
+            p_tip = particles_cpu[:, 18:20]                  # (N, 2) injected real tip
             p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
             n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
 
@@ -257,10 +257,14 @@ def run(config: Config, render: bool = False):
                 f"anal_tip=({anal_tip[0]:+.3f},{anal_tip[1]:+.3f}) "
                 f"FK_err={tip_err:.4f}m"
             )
+            # Use the first particle's tip_pos as representative (all same after inject)
+            injected_tip = particles_cpu[0, 18:20] if particles_cpu.shape[1] > 18 else np.array(anal_tip)
+            inj_obj_dist = np.sqrt((injected_tip[0] - real_obj[0])**2
+                                   + (injected_tip[1] - real_obj[1])**2)
             print(
                 f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
                 f"tip→obj(real)={tip_obj_dist:.3f}m "
-                f"tip→obj(anal)={anal_obj_dist:.3f}m "
+                f"tip→obj(injected)={inj_obj_dist:.3f}m "
                 f"contact_r={CONTACT_RADIUS}"
             )
             print(
