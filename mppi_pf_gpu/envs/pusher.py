@@ -52,11 +52,11 @@ from dynamics import AnalyticalDynamics
 # Physical constants — keep in sync with CUDA #defines in get_cuda_dynamics_code
 # --------------------------------------------------------------------------- #
 NUM_JOINTS     = 7
-DAMPING        = 0.1        # joint velocity damping coefficient
-LINK_MASS      = 1.0        # diagonal mass approximation (kg)
 CONTACT_RADIUS = 0.17       # metres — enlarged contact zone so PF can detect proximity
 PUSH_STRENGTH  = 20.0       # N / (m/s) — strong enough for reaction signal to exceed obs_noise
 FRICTION       = 0.2        # object sliding friction coefficient
+FRAME_SKIP     = 5          # number of inner integration substeps per control step
+INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
 # --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) ---
 # The real arm is 3D, but operates mostly in the XY plane (gravity=0).
@@ -83,6 +83,225 @@ OBS_DIM    = 16             # q(7) + qdot(7) + obj_pos(2)
 
 # Pusher-v5 action bounds (verified at runtime against env.action_space)
 ACTION_BOUND = 2.0
+
+# --------------------------------------------------------------------------- #
+# RNEA rigid-body parameters (computed from Pusher-v5 MJCF geom specs)
+# --------------------------------------------------------------------------- #
+ARMATURE = 0.04             # motor armature (added to M diagonal), from XML default
+
+JOINT_AXES = np.array([
+    [0, 0, 1],   # joint 0: r_shoulder_pan_joint   — Z axis
+    [0, 1, 0],   # joint 1: r_shoulder_lift_joint  — Y axis
+    [1, 0, 0],   # joint 2: r_upper_arm_roll_joint — X axis
+    [0, 1, 0],   # joint 3: r_elbow_flex_joint     — Y axis
+    [1, 0, 0],   # joint 4: r_forearm_roll_joint   — X axis
+    [0, 1, 0],   # joint 5: r_wrist_flex_joint     — Y axis
+    [1, 0, 0],   # joint 6: r_wrist_roll_joint     — X axis
+], dtype=np.float64)
+
+# Position of joint i origin in parent link frame (frame i-1), constant.
+# Accounts for fused (jointless) intermediate bodies.
+JOINT_OFFSETS = np.array([
+    [0.0,   0.0, 0.0],   # joint 0 (base — not used in forward pass)
+    [0.1,   0.0, 0.0],   # shoulder_pan → shoulder_lift
+    [0.0,   0.0, 0.0],   # shoulder_lift → upper_arm_roll
+    [0.4,   0.0, 0.0],   # upper_arm_roll → elbow_flex  (through fused upper_arm_link)
+    [0.0,   0.0, 0.0],   # elbow_flex → forearm_roll
+    [0.321, 0.0, 0.0],   # forearm_roll → wrist_flex  (through fused forearm_link)
+    [0.0,   0.0, 0.0],   # wrist_flex → wrist_roll
+], dtype=np.float64)
+
+# Per-joint damping coefficients (from MJCF joint damping attributes)
+JOINT_DAMPING = np.array([1.0, 1.0, 0.1, 0.1, 0.1, 0.1, 0.1], dtype=np.float64)
+
+
+def _capsule_mass_inertia(p1, p2, radius, density=300.0):
+    """Mass, CoM (midpoint), and 3×3 inertia tensor of a capsule."""
+    p1, p2 = np.asarray(p1, np.float64), np.asarray(p2, np.float64)
+    r = float(radius)
+    axis = p2 - p1
+    L = float(np.linalg.norm(axis))
+    com = (p1 + p2) / 2.0
+
+    m_cyl = density * np.pi * r * r * L
+    m_cap = density * (4.0 / 3.0) * np.pi * r ** 3
+    mass = m_cyl + m_cap
+
+    if L < 1e-12:
+        Iv = (2.0 / 5.0) * mass * r * r
+        return mass, com, np.diag([Iv, Iv, Iv])
+
+    d = axis / L
+    I_cyl_a = 0.5 * m_cyl * r * r
+    I_cyl_t = m_cyl * (r * r / 4.0 + L * L / 12.0)
+    m_h = m_cap / 2.0
+    d_h = L / 2.0 + 3.0 * r / 8.0
+    I_cap_a = 2.0 * (2.0 / 5.0) * m_h * r * r
+    I_cap_t = 2.0 * ((83.0 / 320.0) * m_h * r * r + m_h * d_h * d_h)
+    Ia = I_cyl_a + I_cap_a
+    It = I_cyl_t + I_cap_t
+    inertia = It * np.eye(3) + (Ia - It) * np.outer(d, d)
+    return mass, com, inertia
+
+
+def _sphere_mass_inertia(pos, radius, density=300.0):
+    """Mass, CoM, and 3×3 inertia tensor of a solid sphere."""
+    mass = density * (4.0 / 3.0) * np.pi * radius ** 3
+    com = np.asarray(pos, np.float64)
+    Iv = (2.0 / 5.0) * mass * radius * radius
+    return mass, com, np.diag([Iv, Iv, Iv])
+
+
+def _combine_geom_inertias(geoms):
+    """Combine (mass, com, inertia) tuples into one rigid body."""
+    total_mass = sum(m for m, _, _ in geoms)
+    if total_mass < 1e-30:
+        return 0.0, np.zeros(3), np.zeros((3, 3))
+    com = sum(m * c for m, c, _ in geoms) / total_mass
+    total_I = np.zeros((3, 3))
+    for m, c, I in geoms:
+        d = c - com
+        total_I += I + m * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
+    return total_mass, com, total_I
+
+
+def _compute_link_params():
+    """Compute mass, CoM, inertia for each of the 7 RNEA links from MJCF geoms."""
+    rho = 300.0  # default density
+
+    link_geoms = [
+        # Link 0: r_shoulder_pan_link
+        [_sphere_mass_inertia([-0.06, 0.05, 0.2], 0.05, rho),
+         _sphere_mass_inertia([0.06, 0.05, 0.2], 0.05, rho),
+         _sphere_mass_inertia([-0.06, 0.09, 0.2], 0.03, rho),
+         _sphere_mass_inertia([0.06, 0.09, 0.2], 0.03, rho),
+         _capsule_mass_inertia([0, 0, -0.4], [0, 0, 0.2], 0.1, rho)],
+        # Link 1: r_shoulder_lift_link
+        [_capsule_mass_inertia([0, -0.1, 0], [0, 0.1, 0], 0.1, rho)],
+        # Link 2: r_upper_arm_roll_link + r_upper_arm_link (fused)
+        [_capsule_mass_inertia([-0.1, 0, 0], [0.1, 0, 0], 0.02, rho),
+         _capsule_mass_inertia([0, 0, 0], [0.4, 0, 0], 0.06, rho)],
+        # Link 3: r_elbow_flex_link
+        [_capsule_mass_inertia([0, -0.02, 0], [0, 0.02, 0], 0.06, rho)],
+        # Link 4: r_forearm_roll_link + r_forearm_link (fused)
+        [_capsule_mass_inertia([-0.1, 0, 0], [0.1, 0, 0], 0.02, rho),
+         _capsule_mass_inertia([0, 0, 0], [0.291, 0, 0], 0.05, rho)],
+        # Link 5: r_wrist_flex_link
+        [_capsule_mass_inertia([0, -0.02, 0], [0, 0.02, 0], 0.01, rho)],
+        # Link 6: r_wrist_roll_link + tips_arm (fused)
+        [_capsule_mass_inertia([0, -0.1, 0], [0, 0.1, 0], 0.02, rho),
+         _capsule_mass_inertia([0, -0.1, 0], [0.1, -0.1, 0], 0.02, rho),
+         _capsule_mass_inertia([0, 0.1, 0], [0.1, 0.1, 0], 0.02, rho),
+         _sphere_mass_inertia([0.1, -0.1, 0], 0.01, rho),
+         _sphere_mass_inertia([0.1, 0.1, 0], 0.01, rho)],
+    ]
+
+    masses = np.zeros(7)
+    coms = np.zeros((7, 3))
+    inertias = np.zeros((7, 3, 3))
+    for i, geoms in enumerate(link_geoms):
+        masses[i], coms[i], inertias[i] = _combine_geom_inertias(geoms)
+    return masses, coms, inertias
+
+
+LINK_MASSES, LINK_COMS, LINK_INERTIAS = _compute_link_params()
+
+
+# --------------------------------------------------------------------------- #
+# RNEA helper functions (CPU / numpy)
+# --------------------------------------------------------------------------- #
+
+def _rotation_matrix(axis, angle):
+    """Rodrigues formula: 3×3 rotation about unit *axis* by *angle* radians."""
+    c, s = np.cos(angle), np.sin(angle)
+    t = 1.0 - c
+    x, y, z = axis
+    return np.array([
+        [t * x * x + c,     t * x * y - s * z, t * x * z + s * y],
+        [t * x * y + s * z, t * y * y + c,     t * y * z - s * x],
+        [t * x * z - s * y, t * y * z + s * x, t * z * z + c    ],
+    ])
+
+
+def _rnea_inverse_dynamics(q, qdot, qddot):
+    """
+    Recursive Newton-Euler: returns tau such that
+        M(q) * qddot + C(q, qdot) * qdot = tau
+    Gravity is zero for Pusher-v5.
+    """
+    omega = np.zeros((7, 3))
+    alpha = np.zeros((7, 3))
+    ae    = np.zeros((7, 3))
+    ac    = np.zeros((7, 3))
+    R     = np.zeros((7, 3, 3))
+
+    wp = np.zeros(3)   # omega of previous link (in its own frame)
+    ap = np.zeros(3)   # alpha of previous link
+    lp = np.zeros(3)   # linear accel of previous joint origin
+
+    for i in range(7):
+        R[i] = _rotation_matrix(JOINT_AXES[i], q[i])
+        Rt = R[i].T                                     # parent → child
+
+        wp_i = Rt @ wp                                   # parent ω in frame i
+        omega[i] = wp_i + qdot[i] * JOINT_AXES[i]
+
+        qdot_z = qdot[i] * JOINT_AXES[i]
+        alpha[i] = Rt @ ap + qddot[i] * JOINT_AXES[i] + np.cross(wp_i, qdot_z)
+
+        if i == 0:
+            ae[i] = np.zeros(3)
+        else:
+            p = JOINT_OFFSETS[i]
+            ae[i] = Rt @ (lp + np.cross(ap, p) + np.cross(wp, np.cross(wp, p)))
+
+        c = LINK_COMS[i]
+        ac[i] = ae[i] + np.cross(alpha[i], c) + np.cross(omega[i], np.cross(omega[i], c))
+
+        wp, ap, lp = omega[i], alpha[i], ae[i]
+
+    # Backward pass
+    f = np.zeros((7, 3))
+    n = np.zeros((7, 3))
+    tau = np.zeros(7)
+
+    for i in range(6, -1, -1):
+        Fi = LINK_MASSES[i] * ac[i]
+        Iw = LINK_INERTIAS[i] @ omega[i]
+        Ni = LINK_INERTIAS[i] @ alpha[i] + np.cross(omega[i], Iw)
+
+        f[i] = Fi
+        n[i] = Ni + np.cross(LINK_COMS[i], Fi)
+
+        if i < 6:
+            fc = R[i + 1] @ f[i + 1]
+            nc = R[i + 1] @ n[i + 1]
+            f[i] += fc
+            n[i] += nc + np.cross(JOINT_OFFSETS[i + 1], fc)
+
+        tau[i] = np.dot(n[i], JOINT_AXES[i])
+
+    return tau
+
+
+def _crba_mass_matrix(q):
+    """Composite Rigid-Body Algorithm via RNEA columns.  Returns 7×7 M(q)."""
+    M = np.zeros((7, 7))
+    z7 = np.zeros(7)
+    for j in range(7):
+        ej = np.zeros(7)
+        ej[j] = 1.0
+        M[:, j] = _rnea_inverse_dynamics(q, z7, ej)
+    M += np.diag(np.full(7, ARMATURE))
+    return M
+
+
+def _forward_dynamics_numpy(q, qdot, tau):
+    """Solve  (M + diag(armature)) * qddot = tau − damping·qdot − bias  for qddot."""
+    bias = _rnea_inverse_dynamics(q, qdot, np.zeros(7))
+    M = _crba_mass_matrix(q)
+    rhs = tau - JOINT_DAMPING * qdot - bias
+    return np.linalg.solve(M, rhs)
 
 
 class PusherDynamics(AnalyticalDynamics):
@@ -164,74 +383,72 @@ class PusherDynamics(AnalyticalDynamics):
 
     def f_numpy(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
         """
-        One semi-implicit Euler step on CPU.
+        One control step on CPU using RNEA forward dynamics with 5 substeps.
+
+        Pusher-v5 uses frame_skip=5 with inner dt=0.01.  The integrator
+        performs 5 semi-implicit Euler substeps to match MuJoCo.
 
         state layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)]
         action: (7,) joint torques
-
-        Contact uses state[18:20] (injected true fingertip position) rather
-        than the analytical FK.  This is critical because the FK is a 2-link
-        planar approximation of a 3D arm and can be off by 0.1–0.7m.
-        After integration, tip_pos is updated via FK for MPPI rollouts.
         """
-        state   = np.asarray(state, dtype=np.float64)
-        action  = np.clip(action, -ACTION_BOUND, ACTION_BOUND).astype(np.float64)
-        dt      = self._dt
+        state  = np.asarray(state, dtype=np.float64)
+        action = np.clip(action, -ACTION_BOUND, ACTION_BOUND).astype(np.float64)
 
         q       = state[0:7].copy()
         qdot    = state[7:14].copy()
         obj_pos = state[14:16].copy()
         obj_vel = state[16:18].copy()
-        tip_pos = state[18:20].copy()     # injected real fingertip xy
+        tip_pos = state[18:20].copy()
 
-        # ---- Arm acceleration from applied torques --------------------
-        tau     = action
-        qddot   = (tau - DAMPING * qdot) / LINK_MASS   # shape (7,)
+        dt_sub = INNER_DT
 
-        # ---- Contact detection using REAL tip position ----------------
-        # tip_pos comes from obs[14:16] (injected each step), so contact
-        # is detected at the TRUE fingertip location.  The Jacobian is
-        # still approximate but only used for velocity and reaction torque.
-        J_x, J_y = self._planar_jacobian(q)
-        tip_vx = float(J_x @ qdot)
-        tip_vy = float(J_y @ qdot)
+        for _ in range(FRAME_SKIP):
+            # ---- Contact detection using REAL tip position ----------------
+            J_x, J_y = self._planar_jacobian(q)
+            tip_vx = float(J_x @ qdot)
+            tip_vy = float(J_y @ qdot)
 
-        diff    = obj_pos - tip_pos
-        dist    = np.linalg.norm(diff)
+            diff = obj_pos - tip_pos
+            dist = np.linalg.norm(diff)
 
-        if dist < CONTACT_RADIUS and dist > 1e-8:
-            push_dir    = diff / dist
-            tip_vel     = np.array([tip_vx, tip_vy])
-            v_component = max(0.0, float(tip_vel @ push_dir))
-            push_force  = PUSH_STRENGTH * v_component
+            tau_total = action.copy()
 
-            obj_vel += push_force * push_dir * dt
+            if dist < CONTACT_RADIUS and dist > 1e-8:
+                push_dir    = diff / dist
+                tip_vel     = np.array([tip_vx, tip_vy])
+                v_component = max(0.0, float(tip_vel @ push_dir))
+                push_force  = PUSH_STRENGTH * v_component
 
-            # Newton's 3rd law: reaction on arm via J^T
-            rx = -push_force * push_dir[0]
-            ry = -push_force * push_dir[1]
-            reaction_torque = J_x * rx + J_y * ry
-            qddot += reaction_torque / LINK_MASS
+                obj_vel += push_force * push_dir * dt_sub
 
-        # ---- Semi-implicit Euler (with reaction force in qddot) -------
-        qdot_new = qdot + qddot * dt
-        q_new    = q    + qdot_new * dt
+                # Newton's 3rd law: reaction on arm as joint torque via J^T
+                rx = -push_force * push_dir[0]
+                ry = -push_force * push_dir[1]
+                tau_total += J_x * rx + J_y * ry
 
-        # ---- Object dynamics ------------------------------------------
-        obj_vel *= (1.0 - FRICTION * dt)
-        obj_pos  = obj_pos + obj_vel * dt
+            # ---- RNEA forward dynamics ------------------------------------
+            qddot = _forward_dynamics_numpy(q, qdot, tau_total)
 
-        # ---- Update tip_pos via FK (approximate, for MPPI rollouts) ---
-        tip_new_x, tip_new_y = self._forward_kinematics(q_new)
+            # ---- Semi-implicit Euler substep ------------------------------
+            qdot = qdot + qddot * dt_sub
+            q    = q    + qdot  * dt_sub
+
+            # ---- Object dynamics ------------------------------------------
+            obj_vel *= (1.0 - FRICTION * dt_sub)
+            obj_pos += obj_vel * dt_sub
+
+            # ---- Update tip_pos via FK ------------------------------------
+            tip_x, tip_y = self._forward_kinematics(q)
+            tip_pos = np.array([tip_x, tip_y])
 
         # ---- Pack next state ------------------------------------------
         next_state = np.empty(STATE_DIM, dtype=np.float64)
-        next_state[0:7]   = q_new
-        next_state[7:14]  = qdot_new
+        next_state[0:7]   = q
+        next_state[7:14]  = qdot
         next_state[14:16] = obj_pos
         next_state[16:18] = obj_vel
-        next_state[18]    = tip_new_x
-        next_state[19]    = tip_new_y
+        next_state[18]    = tip_pos[0]
+        next_state[19]    = tip_pos[1]
         return next_state
 
     # ------------------------------------------------------------------ #
@@ -392,206 +609,339 @@ class PusherDynamics(AnalyticalDynamics):
         """
         Return CUDA C device code for the Pusher dynamics and cost.
 
-        The returned string contains:
-          #define  constants   (STATE_DIM, ACTION_DIM, NUM_JOINTS, …)
-          __device__ forward_kinematics(…)
-          __device__ f_pusher(…)         — modifies state in place
-          __device__ cost_pusher(…)      — returns float running cost
+        The returned string is **generated dynamically** so that the RNEA
+        link parameters (mass, CoM, inertia — computed from the MJCF geom
+        specs at import time) are embedded as ``__device__ const`` arrays.
 
         This string is concatenated with kernel strings and compiled once
-        per process via cp.RawKernel.
+        per process via cp.RawModule.
         """
-        return _PUSHER_CUDA_CODE
+        return _generate_cuda_code()
 
 
 # --------------------------------------------------------------------------- #
-# CUDA device code (kept close to f_numpy for easy side-by-side comparison)
+# CUDA device code generator — embeds RNEA link parameters as constants
 # --------------------------------------------------------------------------- #
-_PUSHER_CUDA_CODE = r"""
-/* =========================================================
-   Pusher-v5 CUDA device code
-   State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)] = 20
-   tip_pos = injected real fingertip position; used for contact detection
-   ========================================================= */
 
-#define STATE_DIM       20
-#define ACTION_DIM      7
-#define NUM_JOINTS      7
-#define OBS_DIM         16      /* q(7)+qdot(7)+obj_pos(2) */
-#define DAMPING         0.1f
-#define LINK_MASS       1.0f
-#define CONTACT_RADIUS  0.17f
-#define PUSH_STRENGTH   20.0f
-#define FRICTION        0.2f
-#define ACTION_BOUND    2.0f
+def _fmt1d(arr, fmt=".10e"):
+    """Format a 1-D array as a C initialiser list."""
+    return ", ".join(f"{float(v):{fmt}}f" for v in arr)
 
-/* --- Effective 2-link planar FK (from MuJoCo Pusher-v5 MJCF) ---
-   "fingertip" obs is at the wrist body frame, not 0.1m past it.
-   Verified: at q=0, real_tip=(0.821,-0.6) = base + 0.5 + 0.321.
-   Only used for updating tip_pos during MPPI multi-step rollouts;
-   contact detection uses the injected real tip_pos (state[18:20]). */
-#define BASE_X          0.0f
-#define BASE_Y         -0.6f
-#define N_EFF_LINKS     2
-__device__ const int   EFF_JOINT_IDX[2] = {0, 3};
-__device__ const float EFF_LINK_LEN[2]  = {0.5f, 0.321f};
 
-/* ------------------------------------------------------------------ */
-/* Forward kinematics: 3-link effective planar chain                    */
-/* ------------------------------------------------------------------ */
-__device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y)
-{
-    float cx = BASE_X, cy = BASE_Y;
-    float angle = 0.0f;
-    for (int k = 0; k < N_EFF_LINKS; k++) {
-        angle += q[EFF_JOINT_IDX[k]];
-        cx    += EFF_LINK_LEN[k] * cosf(angle);
-        cy    += EFF_LINK_LEN[k] * sinf(angle);
-    }
-    *tip_x = cx;
-    *tip_y = cy;
+def _fmt2d(arr, fmt=".10e"):
+    """Format a 2-D array as nested C initialisers."""
+    return ", ".join("{" + _fmt1d(row, fmt) + "}" for row in arr)
+
+
+def _generate_cuda_code():
+    """Build CUDA device-code string with RNEA parameters baked in."""
+
+    # Flatten 3×3 inertias to 9-element row-major arrays
+    inertia_flat = LINK_INERTIAS.reshape(7, 9)
+
+    params = (
+        "/* =========================================================\n"
+        "   Pusher-v5 CUDA device code — RNEA rigid-body dynamics\n"
+        "   State: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)]\n"
+        "   ========================================================= */\n\n"
+        "#define STATE_DIM       20\n"
+        "#define ACTION_DIM      7\n"
+        "#define NUM_JOINTS      7\n"
+        "#define OBS_DIM         16\n"
+        "#define CONTACT_RADIUS  0.17f\n"
+        "#define PUSH_STRENGTH   20.0f\n"
+        "#define FRICTION        0.2f\n"
+        "#define ACTION_BOUND    2.0f\n"
+        "#define N_SUBSTEPS      5\n"
+        "#define INNER_DT        0.01f\n"
+        f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n\n"
+        "/* Effective 2-link planar FK (unchanged) */\n"
+        "#define BASE_X  0.0f\n"
+        "#define BASE_Y -0.6f\n"
+        "#define N_EFF_LINKS 2\n"
+        "__device__ const int   EFF_JOINT_IDX[2] = {0, 3};\n"
+        "__device__ const float EFF_LINK_LEN[2]  = {0.5f, 0.321f};\n\n"
+        "/* ---- RNEA link parameters (auto-generated from MJCF geoms) ---- */\n"
+        f"__device__ const float JOINT_AXES_D[7][3]    = {{{_fmt2d(JOINT_AXES)}}};\n"
+        f"__device__ const float JOINT_OFFSETS_D[7][3]  = {{{_fmt2d(JOINT_OFFSETS)}}};\n"
+        f"__device__ const float LINK_MASSES_D[7]       = {{{_fmt1d(LINK_MASSES)}}};\n"
+        f"__device__ const float LINK_COMS_D[7][3]      = {{{_fmt2d(LINK_COMS)}}};\n"
+        f"__device__ const float LINK_INERTIAS_D[7][9]  = {{{_fmt2d(inertia_flat)}}};\n"
+        f"__device__ const float JOINT_DAMPING_D[7]     = {{{_fmt1d(JOINT_DAMPING)}}};\n\n"
+    )
+
+    body = r"""
+/* ================================================================== */
+/*  3-D vector / matrix helpers                                        */
+/* ================================================================== */
+__device__ void cross3(const float* a, const float* b, float* o) {
+    o[0] = a[1]*b[2] - a[2]*b[1];
+    o[1] = a[2]*b[0] - a[0]*b[2];
+    o[2] = a[0]*b[1] - a[1]*b[0];
+}
+__device__ float dot3(const float* a, const float* b) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+/* M is 3x3 row-major */
+__device__ void mv3(const float* M, const float* v, float* o) {
+    o[0] = M[0]*v[0]+M[1]*v[1]+M[2]*v[2];
+    o[1] = M[3]*v[0]+M[4]*v[1]+M[5]*v[2];
+    o[2] = M[6]*v[0]+M[7]*v[1]+M[8]*v[2];
+}
+/* M^T * v */
+__device__ void mtv3(const float* M, const float* v, float* o) {
+    o[0] = M[0]*v[0]+M[3]*v[1]+M[6]*v[2];
+    o[1] = M[1]*v[0]+M[4]*v[1]+M[7]*v[2];
+    o[2] = M[2]*v[0]+M[5]*v[1]+M[8]*v[2];
+}
+/* Rodrigues rotation matrix (axis must be unit), R is 3x3 row-major */
+__device__ void rot_aa(const float* ax, float ang, float* R) {
+    float c = cosf(ang), s = sinf(ang), t = 1.0f - c;
+    float x = ax[0], y = ax[1], z = ax[2];
+    R[0]=t*x*x+c;   R[1]=t*x*y-s*z; R[2]=t*x*z+s*y;
+    R[3]=t*x*y+s*z; R[4]=t*y*y+c;   R[5]=t*y*z-s*x;
+    R[6]=t*x*z-s*y; R[7]=t*y*z+s*x; R[8]=t*z*z+c;
 }
 
-/* ------------------------------------------------------------------ */
-/* Planar Jacobian: computes Jx[7], Jy[7] and tip velocity             */
-/* Only columns EFF_JOINT_IDX[k] are non-zero.                         */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  RNEA inverse dynamics:  tau = M(q)*qddot + C(q,qdot)*qdot         */
+/*  gravity = 0 for Pusher-v5                                          */
+/* ================================================================== */
+__device__ void rnea_inv(const float* q, const float* qd, const float* qdd,
+                         float* tau)
+{
+    float w[7][3], al[7][3], ae[7][3], ac[7][3], Rot[7][9];
+    float wp[3]={0,0,0}, ap[3]={0,0,0}, lp[3]={0,0,0};
+
+    /* Forward pass */
+    for (int i = 0; i < 7; i++) {
+        rot_aa(JOINT_AXES_D[i], q[i], Rot[i]);
+        float wp_i[3]; mtv3(Rot[i], wp, wp_i);
+
+        float qd_z[3];
+        for (int d=0;d<3;d++) qd_z[d] = qd[i]*JOINT_AXES_D[i][d];
+
+        for (int d=0;d<3;d++)
+            w[i][d] = wp_i[d] + qd_z[d];
+
+        float Rt_ap[3]; mtv3(Rot[i], ap, Rt_ap);
+        float cwa[3]; cross3(wp_i, qd_z, cwa);
+        for (int d=0;d<3;d++)
+            al[i][d] = Rt_ap[d] + qdd[i]*JOINT_AXES_D[i][d] + cwa[d];
+
+        if (i == 0) {
+            ae[i][0]=ae[i][1]=ae[i][2]=0.0f;
+        } else {
+            float cp1[3], tmp[3], cp2[3];
+            cross3(ap, JOINT_OFFSETS_D[i], cp1);
+            cross3(wp, JOINT_OFFSETS_D[i], tmp);
+            cross3(wp, tmp, cp2);
+            float v[3];
+            for (int d=0;d<3;d++) v[d] = lp[d]+cp1[d]+cp2[d];
+            mtv3(Rot[i], v, ae[i]);
+        }
+
+        float c1[3], t1[3], c2[3];
+        cross3(al[i], LINK_COMS_D[i], c1);
+        cross3(w[i],  LINK_COMS_D[i], t1);
+        cross3(w[i], t1, c2);
+        for (int d=0;d<3;d++)
+            ac[i][d] = ae[i][d]+c1[d]+c2[d];
+
+        for (int d=0;d<3;d++) { wp[d]=w[i][d]; ap[d]=al[i][d]; lp[d]=ae[i][d]; }
+    }
+
+    /* Backward pass */
+    float f[7][3], n[7][3];
+    for (int i=6; i>=0; i--) {
+        float Fi[3];
+        for (int d=0;d<3;d++) Fi[d] = LINK_MASSES_D[i]*ac[i][d];
+
+        float Iw[3], Ia[3], wIw[3], Ni[3];
+        mv3(&LINK_INERTIAS_D[i][0], w[i], Iw);
+        mv3(&LINK_INERTIAS_D[i][0], al[i], Ia);
+        cross3(w[i], Iw, wIw);
+        for (int d=0;d<3;d++) Ni[d] = Ia[d]+wIw[d];
+
+        float cxF[3]; cross3(LINK_COMS_D[i], Fi, cxF);
+        for (int d=0;d<3;d++) { f[i][d]=Fi[d]; n[i][d]=Ni[d]+cxF[d]; }
+
+        if (i < 6) {
+            float fc[3], nc[3], pxfc[3];
+            mv3(Rot[i+1], f[i+1], fc);
+            mv3(Rot[i+1], n[i+1], nc);
+            cross3(JOINT_OFFSETS_D[i+1], fc, pxfc);
+            for (int d=0;d<3;d++) { f[i][d]+=fc[d]; n[i][d]+=nc[d]+pxfc[d]; }
+        }
+        tau[i] = dot3(n[i], JOINT_AXES_D[i]);
+    }
+}
+
+/* ================================================================== */
+/*  CRBA: M(q) via column-wise RNEA                                    */
+/* ================================================================== */
+__device__ void crba_M(const float* q, float* M) {
+    float z7[7]={0,0,0,0,0,0,0};
+    for (int j=0; j<7; j++) {
+        float ej[7]={0,0,0,0,0,0,0};
+        ej[j]=1.0f;
+        float col[7];
+        rnea_inv(q, z7, ej, col);
+        for (int i=0;i<7;i++) M[i*7+j]=col[i];
+    }
+    for (int j=0;j<7;j++) M[j*7+j] += ARMATURE_VAL;
+}
+
+/* ================================================================== */
+/*  Cholesky solve  A x = b  (A is 7x7 SPD row-major, overwritten)    */
+/* ================================================================== */
+__device__ void chol_solve7(float* A, const float* b, float* x) {
+    /* Decompose A → L */
+    for (int j=0;j<7;j++) {
+        float s=0.0f;
+        for (int k=0;k<j;k++) s += A[j*7+k]*A[j*7+k];
+        A[j*7+j] = sqrtf(fmaxf(A[j*7+j]-s, 1e-12f));
+        float inv = 1.0f / A[j*7+j];
+        for (int i=j+1;i<7;i++) {
+            s=0.0f;
+            for (int k=0;k<j;k++) s += A[i*7+k]*A[j*7+k];
+            A[i*7+j] = (A[i*7+j]-s)*inv;
+        }
+    }
+    /* Forward sub: L y = b */
+    float y[7];
+    for (int i=0;i<7;i++) {
+        float s=b[i];
+        for (int k=0;k<i;k++) s -= A[i*7+k]*y[k];
+        y[i] = s / A[i*7+i];
+    }
+    /* Back sub: L^T x = y */
+    for (int i=6;i>=0;i--) {
+        float s=y[i];
+        for (int k=i+1;k<7;k++) s -= A[k*7+i]*x[k];
+        x[i] = s / A[i*7+i];
+    }
+}
+
+/* ================================================================== */
+/*  Forward kinematics (effective 2-link planar, unchanged)            */
+/* ================================================================== */
+__device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y) {
+    float cx = BASE_X, cy = BASE_Y, angle = 0.0f;
+    for (int k = 0; k < N_EFF_LINKS; k++) {
+        angle += q[EFF_JOINT_IDX[k]];
+        cx += EFF_LINK_LEN[k] * cosf(angle);
+        cy += EFF_LINK_LEN[k] * sinf(angle);
+    }
+    *tip_x = cx;  *tip_y = cy;
+}
+
+/* ================================================================== */
+/*  Planar Jacobian (unchanged)                                        */
+/* ================================================================== */
 __device__ void planar_jacobian(const float* q, const float* qdot,
                                 float* Jx, float* Jy,
                                 float* vx, float* vy)
 {
-    /* Zero all 7 columns */
-    for (int j = 0; j < NUM_JOINTS; j++) { Jx[j] = 0.0f; Jy[j] = 0.0f; }
-
-    /* Cumulative angles at each effective link end */
-    float cum[N_EFF_LINKS];
-    float a = 0.0f;
-    for (int k = 0; k < N_EFF_LINKS; k++) {
-        a      += q[EFF_JOINT_IDX[k]];
-        cum[k]  = a;
-    }
-
-    /* For effective joint k, J column = sum_{m>=k} of link contributions */
-    for (int k = 0; k < N_EFF_LINKS; k++) {
-        float jx = 0.0f, jy = 0.0f;
-        for (int m = k; m < N_EFF_LINKS; m++) {
-            jx += -EFF_LINK_LEN[m] * sinf(cum[m]);
-            jy +=  EFF_LINK_LEN[m] * cosf(cum[m]);
+    for (int j=0;j<NUM_JOINTS;j++){Jx[j]=0.0f;Jy[j]=0.0f;}
+    float cum[N_EFF_LINKS]; float a=0.0f;
+    for (int k=0;k<N_EFF_LINKS;k++){a+=q[EFF_JOINT_IDX[k]];cum[k]=a;}
+    for (int k=0;k<N_EFF_LINKS;k++){
+        float jx=0.0f,jy=0.0f;
+        for (int m=k;m<N_EFF_LINKS;m++){
+            jx += -EFF_LINK_LEN[m]*sinf(cum[m]);
+            jy +=  EFF_LINK_LEN[m]*cosf(cum[m]);
         }
-        Jx[EFF_JOINT_IDX[k]] = jx;
-        Jy[EFF_JOINT_IDX[k]] = jy;
+        Jx[EFF_JOINT_IDX[k]]=jx; Jy[EFF_JOINT_IDX[k]]=jy;
     }
-
-    /* tip velocity = J @ qdot */
-    float tvx = 0.0f, tvy = 0.0f;
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        tvx += Jx[j] * qdot[j];
-        tvy += Jy[j] * qdot[j];
-    }
-    *vx = tvx;
-    *vy = tvy;
+    float tvx=0.0f,tvy=0.0f;
+    for (int j=0;j<NUM_JOINTS;j++){tvx+=Jx[j]*qdot[j];tvy+=Jy[j]*qdot[j];}
+    *vx=tvx; *vy=tvy;
 }
 
-/* ------------------------------------------------------------------ */
-/* f_pusher: semi-implicit Euler step, modifies state[] in place       */
-/*                                                                      */
-/* Contact is computed BEFORE Euler integration so the reaction force   */
-/* modifies qddot.  This makes q_new/qdot_new depend on obj_pos —     */
-/* the signal the particle filter uses to discriminate hypotheses.      */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  f_pusher: RNEA forward dynamics, 5 substeps, modifies state[]      */
+/* ================================================================== */
 __device__ void f_pusher(float* state, const float* action, float dt)
 {
-    float* q       = state;          /* [0..6]   */
-    float* qdot    = state + 7;      /* [7..13]  */
-    float* obj_pos = state + 14;     /* [14..15] */
-    float* obj_vel = state + 16;     /* [16..17] */
-    float* tip_pos = state + 18;     /* [18..19] injected real tip xy */
+    float* q       = state;
+    float* qdot    = state + 7;
+    float* obj_pos = state + 14;
+    float* obj_vel = state + 16;
+    float* tip_pos = state + 18;
 
-    /* ---- Arm acceleration from applied torques ---- */
-    float qddot[NUM_JOINTS];
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        float tau = fminf(fmaxf(action[j], -ACTION_BOUND), ACTION_BOUND);
-        qddot[j]  = (tau - DAMPING * qdot[j]) / LINK_MASS;
-    }
+    float tau[NUM_JOINTS];
+    for (int j=0;j<NUM_JOINTS;j++)
+        tau[j] = fminf(fmaxf(action[j], -ACTION_BOUND), ACTION_BOUND);
 
-    /* ---- Contact using REAL tip position (state[18:20]) ---- */
-    /* Jacobian is still approximate — only used for velocity + reaction */
-    float Jx[NUM_JOINTS], Jy[NUM_JOINTS];
-    float tip_vx, tip_vy;
-    planar_jacobian(q, qdot, Jx, Jy, &tip_vx, &tip_vy);
+    for (int sub = 0; sub < N_SUBSTEPS; sub++) {
+        /* ---- Contact ---- */
+        float Jx[NUM_JOINTS], Jy[NUM_JOINTS], tvx, tvy;
+        planar_jacobian(q, qdot, Jx, Jy, &tvx, &tvy);
+        float dx = obj_pos[0]-tip_pos[0], dy = obj_pos[1]-tip_pos[1];
+        float dist = sqrtf(dx*dx+dy*dy);
 
-    float dx   = obj_pos[0] - tip_pos[0];
-    float dy   = obj_pos[1] - tip_pos[1];
-    float dist = sqrtf(dx * dx + dy * dy);
+        float tau_t[NUM_JOINTS];
+        for (int j=0;j<NUM_JOINTS;j++) tau_t[j]=tau[j];
 
-    if (dist < CONTACT_RADIUS && dist > 1e-8f) {
-        float inv_dist   = 1.0f / dist;
-        float push_dir_x = dx * inv_dist;
-        float push_dir_y = dy * inv_dist;
-        float v_comp     = tip_vx * push_dir_x + tip_vy * push_dir_y;
-        v_comp           = fmaxf(v_comp, 0.0f);
-        float push_force = PUSH_STRENGTH * v_comp;
-
-        /* Force on object */
-        obj_vel[0] += push_force * push_dir_x * dt;
-        obj_vel[1] += push_force * push_dir_y * dt;
-
-        /* Newton's 3rd law: reaction on arm via J^T */
-        float rx = -push_force * push_dir_x;
-        float ry = -push_force * push_dir_y;
-        for (int j = 0; j < NUM_JOINTS; j++) {
-            qddot[j] += (Jx[j] * rx + Jy[j] * ry) / LINK_MASS;
+        if (dist < CONTACT_RADIUS && dist > 1e-8f) {
+            float id = 1.0f/dist;
+            float pdx=dx*id, pdy=dy*id;
+            float vc = fmaxf(tvx*pdx+tvy*pdy, 0.0f);
+            float pf = PUSH_STRENGTH*vc;
+            obj_vel[0] += pf*pdx*INNER_DT;
+            obj_vel[1] += pf*pdy*INNER_DT;
+            float rx=-pf*pdx, ry=-pf*pdy;
+            for (int j=0;j<NUM_JOINTS;j++)
+                tau_t[j] += Jx[j]*rx + Jy[j]*ry;
         }
+
+        /* ---- RNEA forward dynamics ---- */
+        float bias[NUM_JOINTS];
+        float z7[7]={0,0,0,0,0,0,0};
+        rnea_inv(q, qdot, z7, bias);
+
+        float M[49];
+        crba_M(q, M);
+
+        float rhs[NUM_JOINTS];
+        for (int j=0;j<NUM_JOINTS;j++)
+            rhs[j] = tau_t[j] - JOINT_DAMPING_D[j]*qdot[j] - bias[j];
+
+        float qdd[NUM_JOINTS];
+        chol_solve7(M, rhs, qdd);
+
+        /* ---- Semi-implicit Euler substep ---- */
+        for (int j=0;j<NUM_JOINTS;j++) {
+            qdot[j] += qdd[j]*INNER_DT;
+            q[j]    += qdot[j]*INNER_DT;
+        }
+
+        float fric = 1.0f - FRICTION*INNER_DT;
+        obj_vel[0] *= fric;  obj_vel[1] *= fric;
+        obj_pos[0] += obj_vel[0]*INNER_DT;
+        obj_pos[1] += obj_vel[1]*INNER_DT;
+
+        forward_kinematics(q, &tip_pos[0], &tip_pos[1]);
     }
-
-    /* ---- Semi-implicit Euler (reaction force included in qddot) ---- */
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        qdot[j] = qdot[j] + qddot[j] * dt;
-        q[j]    = q[j]    + qdot[j] * dt;
-    }
-
-    /* ---- Object dynamics ---- */
-    float one_minus_fric = 1.0f - FRICTION * dt;
-    obj_vel[0] *= one_minus_fric;
-    obj_vel[1] *= one_minus_fric;
-    obj_pos[0] += obj_vel[0] * dt;
-    obj_pos[1] += obj_vel[1] * dt;
-
-    /* ---- Update tip_pos via FK (approximate, for MPPI rollouts) ---- */
-    forward_kinematics(q, &tip_pos[0], &tip_pos[1]);
 }
 
-/* ------------------------------------------------------------------ */
-/* cost_pusher: running cost for MPPI rollouts (negated Pusher-v5 reward) */
-/* Pusher-v5 reward:                                                    */
-/*   reward_near = -0.5 * ||fingertip - obj_pos||                      */
-/*   reward_dist = -1.0 * ||obj_pos   - goal_pos||                     */
-/*   reward_ctrl = -0.1 * ||action||^2                                 */
-/* cost = -reward = 0.5*d_near + 1.0*d_dist + 0.1*||a||^2             */
-/* target: (2,) — 2-D goal position                                    */
-/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  cost_pusher: running cost (unchanged from original)                */
+/* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target)
 {
     const float* obj_pos = state + 14;
-    const float* tip_pos = state + 18;   /* use stored tip position */
-
-    /* reward_near: ||fingertip - obj_pos|| */
-    float dx1  = tip_pos[0] - obj_pos[0];
-    float dy1  = tip_pos[1] - obj_pos[1];
-    float d1   = sqrtf(dx1 * dx1 + dy1 * dy1);
-
-    /* reward_dist: ||obj_pos - target_pos|| */
-    float dx2  = obj_pos[0] - target[0];
-    float dy2  = obj_pos[1] - target[1];
-    float d2   = sqrtf(dx2 * dx2 + dy2 * dy2);
-
-    /* reward_ctrl: ||action||^2 */
-    float act2 = 0.0f;
-    for (int a = 0; a < ACTION_DIM; a++) {
-        act2 += action[a] * action[a];
-    }
-
-    return 0.5f * d1 + 1.0f * d2 + 0.1f * act2;
+    const float* tip_pos = state + 18;
+    float dx1=tip_pos[0]-obj_pos[0], dy1=tip_pos[1]-obj_pos[1];
+    float d1 = sqrtf(dx1*dx1+dy1*dy1);
+    float dx2=obj_pos[0]-target[0], dy2=obj_pos[1]-target[1];
+    float d2 = sqrtf(dx2*dx2+dy2*dy2);
+    float act2=0.0f;
+    for (int a=0;a<ACTION_DIM;a++) act2+=action[a]*action[a];
+    return 0.5f*d1 + 1.0f*d2 + 0.1f*act2;
 }
 """
+
+    return params + body

@@ -30,6 +30,7 @@ CPU-GPU bus crossings per step
 
 import argparse
 import time
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -101,6 +102,12 @@ def run(config: Config, render: bool = False):
     timing_log   = []
     prev_action  = None           # no prior action on the first step
 
+    # ---- Observation-delay buffers -----------------------------------------
+    obs_buffer    = deque(maxlen=config.obs_delay + 1)
+    action_buffer = deque(maxlen=config.obs_delay)
+    # Seed with the initial observation (no noise) so delay doesn't starve
+    obs_buffer.append(obs.copy())
+
     # ---- Initial diagnostics -----------------------------------------------
     print(f"\n{'='*60}")
     print(f"  INIT DIAG")
@@ -123,76 +130,61 @@ def run(config: Config, render: bool = False):
 
         # ========================= GPU WORK =================================
         #
-        # Key insight — observation injection:
-        #   The approximate dynamics model (diagonal mass, planar FK) drifts
-        #   from MuJoCo's real arm state over multiple steps.  After a few
-        #   steps ALL particles' q/qdot predictions are equally wrong, so
-        #   the weight update can't distinguish particles with different
-        #   object positions — the contact signal is lost in model error.
-        #
-        #   Fix: every step we (a) inject the true q/qdot into all particles,
-        #   (b) propagate ONE step with the action just applied, then
-        #   (c) compare that one-step prediction against the new obs.
-        #   Because every particle starts from the SAME true arm state, the
-        #   only source of prediction difference is their object-position
-        #   hypothesis and the resulting contact forces.  This makes the PF
-        #   genuinely functional.
-        #
-        # Step order (after step 0):
-        #   1. inject obs_{t} → overwrite q/qdot in all particles
-        #   2. propagate with prev_action → one-step prediction
-        #      (differs per particle only through contact with their obj_pos)
-        #   3. weight update comparing prediction against obs_{t}
-        #   4. ESS + adaptive resampling
-        #   5. sample K states for MPPI
-        #   6. MPPI → action_t
-        #
-        # On step 0 we skip inject+propagate because particles were just
-        # initialised from the first obs and there is no prior action.
+        # Observation-delay protocol:
+        #   PF particles track belief at time (t − d).  Each step we feed
+        #   the DELAYED observation (from d steps ago) to pf.update().
+        #   For MPPI we need current-time estimates, so sample_current()
+        #   propagates temporary copies through the d recent actions.
+
+        # -- Delayed observation ------------------------------------------
+        delayed_obs = obs_buffer[0]          # oldest buffered obs (d steps old)
 
         if prev_action is not None:
-            # 1. Inject the PREVIOUS observation's q/qdot into particles
-            #    so propagation starts from the true arm state.
-            pf.inject_observation(prev_obs)
-
-            # 2. Propagate one step with prev_action.  Each particle now
-            #    predicts what q/qdot should be at this step, given its
-            #    own obj_pos hypothesis and the contact model.
+            pf.inject_observation(prev_delayed_obs)
             pf.propagate(prev_action)
 
-        # 3. Weight update: compare predicted q/qdot against actual obs
-        pf.update(obs)
+        # Weight update against delayed observation
+        pf.update(delayed_obs)
 
-        # 4. ESS must be computed BEFORE resample() — resample resets all
-        #    weights to 1/N, which would always give ESS == N and make the
-        #    metric useless for the future scheduler.
         ess = pf.effective_sample_size()
 
-        # 5. Adaptive resampling: only resample when diversity falls below
-        #    the threshold.
         if ess < config.resample_threshold * config.N:
             pf.resample()
 
-        # 6. Sample K initial states from belief for MPPI rollouts.
-        #    Before sampling, inject the CURRENT true q/qdot so MPPI
-        #    rollouts start from the real arm configuration.
-        pf.inject_observation(obs)
-        initial_states = pf.sample(mppi.K)          # (K, state_dim) on GPU
+        # -- Delay-aware sampling -----------------------------------------
+        pf.inject_observation(delayed_obs)
 
-        # 7. MPPI planning step — returns next action on CPU
+        t_delay_start = time.perf_counter()
+        if len(action_buffer) > 0:
+            initial_states = pf.sample_current(mppi.K, list(action_buffer))
+        else:
+            initial_states = pf.sample(mppi.K)
+        cp.cuda.Device(config.device_id).synchronize()
+        t_delay_end = time.perf_counter()
+        T_pf_delay_ms = (t_delay_end - t_delay_start) * 1e3
+
+        # MPPI planning
         action, mppi_timing = mppi.compute_action(initial_states)
 
-        # Flush all pending GPU kernels before timestamping
         cp.cuda.Device(config.device_id).synchronize()
         # ========================= END GPU WORK =============================
         t_gpu_end = time.perf_counter()
 
         # ========================= CPU / ENV WORK ===========================
-        prev_obs    = obs                           # save for next step's injection
-        prev_action = action                        # save for next step's propagation
+        prev_delayed_obs = delayed_obs
+        prev_action      = action
 
         obs, reward, terminated, truncated, _info = env.step(action)
         obs = obs.astype(np.float32)
+
+        # -- Sensor noise + delay buffers ---------------------------------
+        noisy_obs = obs.copy()
+        noisy_obs += np.random.normal(
+            0.0, config.sensor_noise_std, obs.shape,
+        ).astype(np.float32)
+        obs_buffer.append(noisy_obs)
+        action_buffer.append(action.copy())
+
         t_env_end = time.perf_counter()
         # ========================= END CPU / ENV WORK =======================
 
@@ -208,6 +200,7 @@ def run(config: Config, render: bool = False):
             "T_total_ms": T_total_ms,
             "T_gpu_ms":   T_gpu_ms,
             "T_env_ms":   T_env_ms,
+            "T_pf_delay_propagate_ms": T_pf_delay_ms,
             "ESS":        ess,
             "K_used":     mppi._K_active,  # reflects any per-step K override
             "reward":     float(reward),
@@ -221,7 +214,8 @@ def run(config: Config, render: bool = False):
             print(
                 f"Step {t:4d} | "
                 f"R={reward:7.3f} | "
-                f"T={T_total_ms:6.2f}ms (GPU={T_gpu_ms:5.2f} ENV={T_env_ms:5.2f}) | "
+                f"T={T_total_ms:6.2f}ms (GPU={T_gpu_ms:5.2f} ENV={T_env_ms:5.2f} "
+                f"delay={T_pf_delay_ms:5.2f}) | "
                 f"ESS={ess:6.0f}/{config.N} | "
                 f"K={mppi.K}"
             )

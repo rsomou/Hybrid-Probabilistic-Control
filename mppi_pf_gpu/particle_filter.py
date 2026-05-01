@@ -257,6 +257,53 @@ class ParticleFilter:
         return self.particles[indices].copy()
 
     # ------------------------------------------------------------------ #
+    # Delay-aware sampling
+    # ------------------------------------------------------------------ #
+
+    def sample_current(self, K: int, action_history: list) -> cp.ndarray:
+        """
+        Particles represent belief at time t-d (delayed).
+        Propagate **copies** forward through the d known past actions
+        to produce current-time state estimates, then draw K samples.
+
+        This method does NOT modify the PF's internal state.
+
+        Parameters
+        ----------
+        K              : int  — number of samples
+        action_history : list of (action_dim,) arrays — d actions
+
+        Returns
+        -------
+        cp.ndarray, shape (K, state_dim), dtype float32 — on GPU
+        """
+        propagated = self.particles.copy()
+
+        for action in action_history:
+            action_gpu = cp.asarray(action, dtype=cp.float32)
+            noise = self.gpu.generate_normal(
+                (self.N, self.dynamics.state_dim), std=1.0,
+            )
+            grid, block = self.gpu.get_grid_block(self.N)
+            self._propagate_kernel(
+                grid, block,
+                (
+                    propagated,
+                    action_gpu,
+                    noise,
+                    cp.float32(self.config.process_noise_std),
+                    cp.float32(self.config.process_noise_std_obj),
+                    cp.float32(self.config.dt),
+                    np.int32(self.N),
+                ),
+            )
+
+        indices = cp.random.choice(
+            self.N, size=K, replace=True, p=self.weights,
+        )
+        return propagated[indices].copy()
+
+    # ------------------------------------------------------------------ #
     # Diagnostics
     # ------------------------------------------------------------------ #
 

@@ -39,6 +39,12 @@ class Config:
     sigma: float = 0.5               # perturbation std
 
     # ------------------------------------------------------------------ #
+    # Observation Delay
+    # ------------------------------------------------------------------ #
+    obs_delay: int = 3               # PF receives obs from d steps ago
+    sensor_noise_std: float = 0.02   # std of additive sensor noise on observations
+
+    # ------------------------------------------------------------------ #
     # Simulation
     # ------------------------------------------------------------------ #
     max_steps: int = 300
