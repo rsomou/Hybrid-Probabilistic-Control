@@ -104,8 +104,11 @@ class ParticleFilter:
         ----------
         obs : (23,) numpy array — raw Pusher-v5 gym observation
         """
-        pf_obs  = self.dynamics.gym_obs_to_pf_obs(obs)       # (14,) q + qdot
-        obs_gpu = cp.asarray(pf_obs, dtype=cp.float32)       # → GPU
+        # Extract only q/qdot (first 14 dims of raw obs) for injection.
+        # gym_obs_to_pf_obs() now returns 16 dims (includes obj_pos) which
+        # is used by the weight update, but injection only overwrites q/qdot.
+        q_qdot  = obs[0:14].astype(np.float32)
+        obs_gpu = cp.asarray(q_qdot, dtype=cp.float32)       # → GPU
 
         # Broadcast observed q/qdot to all N particles, add tiny jitter
         jitter = cp.random.normal(
