@@ -100,13 +100,16 @@ def run(config: Config, render: bool = False):
 
     total_reward = 0.0
     timing_log   = []
-    prev_action  = None           # no prior action on the first step
 
     # ---- Observation-delay buffers -----------------------------------------
+    # obs_buffer:    maxlen = d+1  (stores delayed obs window)
+    # action_buffer: maxlen = d+1  (oldest entry = action for PF propagation,
+    #                               remaining d entries = actions for sample_current)
     obs_buffer    = deque(maxlen=config.obs_delay + 1)
-    action_buffer = deque(maxlen=config.obs_delay)
+    action_buffer = deque(maxlen=config.obs_delay + 1)
     # Seed with the initial observation (no noise) so delay doesn't starve
     obs_buffer.append(obs.copy())
+    prev_delayed_obs = obs.copy()   # safe initialisation for first inject
 
     # ---- Initial diagnostics -----------------------------------------------
     print(f"\n{'='*60}")
@@ -139,9 +142,14 @@ def run(config: Config, render: bool = False):
         # -- Delayed observation ------------------------------------------
         delayed_obs = obs_buffer[0]          # oldest buffered obs (d steps old)
 
-        if prev_action is not None:
+        # PF inject + propagate: only after the action buffer has d+1 entries
+        # so that action_buffer[0] is the action from the DELAYED transition
+        # (the action applied at step t-d-1 that moved state from
+        #  prev_delayed_obs to delayed_obs).
+        if len(action_buffer) > config.obs_delay:
+            delayed_action = action_buffer[0]
             pf.inject_observation(prev_delayed_obs)
-            pf.propagate(prev_action)
+            pf.propagate(delayed_action)
 
         # Weight update against delayed observation
         pf.update(delayed_obs)
@@ -155,8 +163,15 @@ def run(config: Config, render: bool = False):
         pf.inject_observation(delayed_obs)
 
         t_delay_start = time.perf_counter()
-        if len(action_buffer) > 0:
-            initial_states = pf.sample_current(mppi.K, list(action_buffer))
+        # sample_current propagates copies through the last d actions
+        # (action_buffer[1:] in steady state, all of action_buffer during warmup)
+        if len(action_buffer) > config.obs_delay:
+            recent_actions = list(action_buffer)[1:]   # last d actions
+        else:
+            recent_actions = list(action_buffer)        # warmup: all we have
+
+        if len(recent_actions) > 0:
+            initial_states = pf.sample_current(mppi.K, recent_actions)
         else:
             initial_states = pf.sample(mppi.K)
         cp.cuda.Device(config.device_id).synchronize()
@@ -172,7 +187,6 @@ def run(config: Config, render: bool = False):
 
         # ========================= CPU / ENV WORK ===========================
         prev_delayed_obs = delayed_obs
-        prev_action      = action
 
         obs, reward, terminated, truncated, _info = env.step(action)
         obs = obs.astype(np.float32)
