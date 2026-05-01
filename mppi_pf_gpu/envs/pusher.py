@@ -45,12 +45,35 @@ from dynamics import AnalyticalDynamics
 # Physical constants — keep in sync with CUDA #defines in get_cuda_dynamics_code
 # --------------------------------------------------------------------------- #
 NUM_JOINTS     = 7
-LINK_LENGTH    = 0.1        # metres per link
 DAMPING        = 0.1        # joint velocity damping coefficient
 LINK_MASS      = 1.0        # diagonal mass approximation (kg)
 CONTACT_RADIUS = 0.06       # metres — fingertip contact sphere
 PUSH_STRENGTH  = 5.0        # N / (m/s) — impulse scaling
 FRICTION       = 0.2        # object sliding friction coefficient
+
+# --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) ---
+# The real arm is 3D, but operates mostly in the XY plane (gravity=0).
+# Joints 0 (shoulder_pan), 3 (elbow_flex), 5 (wrist_flex) control XY.
+# Joints 1,2,4,6 (lift/roll) mostly affect Z — we ignore them for 2D.
+#
+# Body hierarchy offsets from the MJCF:
+#   shoulder_pan_link  at (0, -0.6, 0)   — base
+#   shoulder_lift_link at (0.1, 0, 0)    — small offset after pan
+#   upper_arm_link     geom to (0.4, 0, 0) — upper arm
+#   elbow_flex_link    at (0.4, 0, 0)    — elbow
+#   forearm_link       geom to (0.291, 0, 0), wrist at (0.321,0,0)
+#   wrist_flex_link    at (0.321, 0, 0)  — wrist
+#   fingertip          at (0.1, 0, 0)    — tip offset
+#
+# Effective 3-link chain in XY:
+#   link 0: shoulder → elbow  = 0.1 + 0.4 = 0.5m  (rotated by q[0])
+#   link 1: elbow → wrist     = 0.321m             (rotated by q[0]+q[3])
+#   link 2: wrist → fingertip = 0.1m               (rotated by q[0]+q[3]+q[5])
+BASE_X         = 0.0
+BASE_Y         = -0.6
+EFF_LINK_LENGTHS = [0.5, 0.321, 0.1]     # metres
+EFF_JOINT_INDICES = [0, 3, 5]            # which q[] indices affect XY FK
+N_EFF_LINKS    = 3
 
 STATE_DIM  = 18             # 7q + 7qdot + 2 obj_pos + 2 obj_vel
 ACTION_DIM = 7
@@ -85,40 +108,56 @@ class PusherDynamics(AnalyticalDynamics):
     @staticmethod
     def _forward_kinematics(q: np.ndarray):
         """
-        Compute fingertip (x, y) and fingertip velocity direction components.
+        Compute fingertip (x, y) using the effective 3-link planar model.
+
+        Only joints 0, 3, 5 affect the XY plane position (the others are
+        lift/roll joints that mostly change Z).
 
         Returns
         -------
         tip_x, tip_y : float
             Fingertip position in the planar workspace.
         """
-        tip_x = 0.0
-        tip_y = 0.0
+        tip_x = BASE_X
+        tip_y = BASE_Y
         cumulative_angle = 0.0
-        for j in range(NUM_JOINTS):
-            cumulative_angle += q[j]
-            tip_x += LINK_LENGTH * np.cos(cumulative_angle)
-            tip_y += LINK_LENGTH * np.sin(cumulative_angle)
+        for k in range(N_EFF_LINKS):
+            cumulative_angle += q[EFF_JOINT_INDICES[k]]
+            tip_x += EFF_LINK_LENGTHS[k] * np.cos(cumulative_angle)
+            tip_y += EFF_LINK_LENGTHS[k] * np.sin(cumulative_angle)
         return tip_x, tip_y
 
     @staticmethod
-    def _fingertip_velocity(q: np.ndarray, qdot: np.ndarray):
+    def _planar_jacobian(q: np.ndarray):
         """
-        Approximate fingertip velocity via Jacobian (planar, first-order).
-        J_x[j] = -sum_{k>=j} L * sin(sum_{i<=k} q[i])
-        J_y[j] =  sum_{k>=j} L * cos(sum_{i<=k} q[i])
+        Compute the 2×7 Jacobian mapping qdot → fingertip velocity in XY.
+
+        Only the 3 effective joints (0, 3, 5) have non-zero columns.
+        Returns J_x, J_y as (7,) arrays (zero for non-effective joints).
         """
-        angles = np.cumsum(q)                         # (7,) cumulative angles
-        sin_a  = np.sin(angles)
-        cos_a  = np.cos(angles)
+        J_x = np.zeros(NUM_JOINTS, dtype=np.float64)
+        J_y = np.zeros(NUM_JOINTS, dtype=np.float64)
 
-        # Reverse-cumsum trick: contribution of joint j is sum over k >= j
-        J_x = -np.cumsum(LINK_LENGTH * sin_a[::-1])[::-1]  # (7,)
-        J_y =  np.cumsum(LINK_LENGTH * cos_a[::-1])[::-1]  # (7,)
+        # Cumulative angle at each effective link end
+        cum_angles = np.zeros(N_EFF_LINKS)
+        a = 0.0
+        for k in range(N_EFF_LINKS):
+            a += q[EFF_JOINT_INDICES[k]]
+            cum_angles[k] = a
 
-        vx = float(J_x @ qdot)
-        vy = float(J_y @ qdot)
-        return vx, vy
+        # For effective joint k, its column in J is the sum of
+        # -L_m * sin(cum_m) / +L_m * cos(cum_m) for all m >= k
+        for k in range(N_EFF_LINKS):
+            jx = 0.0
+            jy = 0.0
+            for m in range(k, N_EFF_LINKS):
+                jx += -EFF_LINK_LENGTHS[m] * np.sin(cum_angles[m])
+                jy +=  EFF_LINK_LENGTHS[m] * np.cos(cum_angles[m])
+            j_idx = EFF_JOINT_INDICES[k]
+            J_x[j_idx] = jx
+            J_y[j_idx] = jy
+
+        return J_x, J_y
 
     # ------------------------------------------------------------------ #
     # CPU dynamics
@@ -140,28 +179,45 @@ class PusherDynamics(AnalyticalDynamics):
         obj_pos = state[14:16].copy()
         obj_vel = state[16:18].copy()
 
-        # ---- Arm dynamics (diagonal mass matrix approximation) --------
+        # ---- Arm acceleration from applied torques --------------------
         tau     = action
         qddot   = (tau - DAMPING * qdot) / LINK_MASS   # shape (7,)
 
-        # Semi-implicit Euler
-        qdot_new = qdot + qddot * dt
-        q_new    = q    + qdot_new * dt
+        # ---- Forward kinematics & contact (BEFORE Euler integration) --
+        # Contact must be computed before integration so the reaction
+        # force can modify qddot.  This makes q_new/qdot_new depend on
+        # obj_pos — the key signal the particle filter uses to
+        # discriminate between object-position hypotheses.
+        tip_x, tip_y = self._forward_kinematics(q)
 
-        # ---- Forward kinematics & contact force on object -------------
-        tip_x, tip_y   = self._forward_kinematics(q)
-        tip_vx, tip_vy = self._fingertip_velocity(q, qdot)
+        # Compute Jacobian (needed for velocity AND reaction torque)
+        J_x, J_y = self._planar_jacobian(q)
+
+        tip_vx = float(J_x @ qdot)
+        tip_vy = float(J_y @ qdot)
 
         diff    = obj_pos - np.array([tip_x, tip_y])
         dist    = np.linalg.norm(diff)
 
         if dist < CONTACT_RADIUS and dist > 1e-8:
-            push_dir    = diff / dist                    # unit vector
-            # Component of tip velocity along push direction
+            push_dir    = diff / dist                    # unit vector tip→obj
             tip_vel     = np.array([tip_vx, tip_vy])
-            v_component = max(0.0, float(tip_vel @ push_dir))  # contact can only push, not pull
+            v_component = max(0.0, float(tip_vel @ push_dir))
             push_force  = PUSH_STRENGTH * v_component
-            obj_vel    += push_force * push_dir * dt
+
+            # Force on object (push away from fingertip)
+            obj_vel += push_force * push_dir * dt
+
+            # Newton's 3rd law: reaction force on fingertip = −F
+            # Map to joint torques via Jacobian transpose: τ = J^T @ (−F)
+            rx = -push_force * push_dir[0]
+            ry = -push_force * push_dir[1]
+            reaction_torque = J_x * rx + J_y * ry       # (7,)
+            qddot += reaction_torque / LINK_MASS
+
+        # ---- Semi-implicit Euler (with reaction force in qddot) -------
+        qdot_new = qdot + qddot * dt
+        q_new    = q    + qdot_new * dt
 
         # ---- Object dynamics ------------------------------------------
         obj_vel *= (1.0 - FRICTION * dt)                 # friction damping
@@ -352,7 +408,6 @@ _PUSHER_CUDA_CODE = r"""
 #define ACTION_DIM      7
 #define NUM_JOINTS      7
 #define OBS_DIM         14      /* q(7)+qdot(7) only — obj_pos withheld (partial obs) */
-#define LINK_LENGTH     0.1f
 #define DAMPING         0.1f
 #define LINK_MASS       1.0f
 #define CONTACT_RADIUS  0.06f
@@ -360,48 +415,61 @@ _PUSHER_CUDA_CODE = r"""
 #define FRICTION        0.2f
 #define ACTION_BOUND    2.0f
 
+/* --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) --- */
+/* Only joints 0, 3, 5 affect XY.  Others are lift/roll (mostly Z). */
+#define BASE_X          0.0f
+#define BASE_Y         -0.6f
+#define N_EFF_LINKS     3
+__device__ const int   EFF_JOINT_IDX[3] = {0, 3, 5};
+__device__ const float EFF_LINK_LEN[3]  = {0.5f, 0.321f, 0.1f};
+
 /* ------------------------------------------------------------------ */
-/* Forward kinematics: cumulative sum of link vectors                   */
+/* Forward kinematics: 3-link effective planar chain                    */
 /* ------------------------------------------------------------------ */
 __device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y)
 {
-    float cx = 0.0f, cy = 0.0f;
+    float cx = BASE_X, cy = BASE_Y;
     float angle = 0.0f;
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        angle += q[j];
-        cx    += LINK_LENGTH * cosf(angle);
-        cy    += LINK_LENGTH * sinf(angle);
+    for (int k = 0; k < N_EFF_LINKS; k++) {
+        angle += q[EFF_JOINT_IDX[k]];
+        cx    += EFF_LINK_LEN[k] * cosf(angle);
+        cy    += EFF_LINK_LEN[k] * sinf(angle);
     }
     *tip_x = cx;
     *tip_y = cy;
 }
 
 /* ------------------------------------------------------------------ */
-/* Fingertip velocity via planar Jacobian                               */
-/* J_x[j] = -sum_{k>=j} L*sin(sum_{i<=k} q[i])                       */
-/* J_y[j] =  sum_{k>=j} L*cos(sum_{i<=k} q[i])                       */
+/* Planar Jacobian: computes Jx[7], Jy[7] and tip velocity             */
+/* Only columns EFF_JOINT_IDX[k] are non-zero.                         */
 /* ------------------------------------------------------------------ */
-__device__ void fingertip_velocity(const float* q, const float* qdot,
-                                   float* vx, float* vy)
+__device__ void planar_jacobian(const float* q, const float* qdot,
+                                float* Jx, float* Jy,
+                                float* vx, float* vy)
 {
-    /* Precompute cumulative angles */
-    float cum[NUM_JOINTS];
+    /* Zero all 7 columns */
+    for (int j = 0; j < NUM_JOINTS; j++) { Jx[j] = 0.0f; Jy[j] = 0.0f; }
+
+    /* Cumulative angles at each effective link end */
+    float cum[N_EFF_LINKS];
     float a = 0.0f;
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        a     += q[j];
-        cum[j] = a;
+    for (int k = 0; k < N_EFF_LINKS; k++) {
+        a      += q[EFF_JOINT_IDX[k]];
+        cum[k]  = a;
     }
 
-    /* Reverse cumulative sum for Jacobian rows */
-    float Jx[NUM_JOINTS], Jy[NUM_JOINTS];
-    float sx = 0.0f, sy = 0.0f;
-    for (int j = NUM_JOINTS - 1; j >= 0; j--) {
-        sx    += -LINK_LENGTH * sinf(cum[j]);
-        sy    +=  LINK_LENGTH * cosf(cum[j]);
-        Jx[j] = sx;
-        Jy[j] = sy;
+    /* For effective joint k, J column = sum_{m>=k} of link contributions */
+    for (int k = 0; k < N_EFF_LINKS; k++) {
+        float jx = 0.0f, jy = 0.0f;
+        for (int m = k; m < N_EFF_LINKS; m++) {
+            jx += -EFF_LINK_LEN[m] * sinf(cum[m]);
+            jy +=  EFF_LINK_LEN[m] * cosf(cum[m]);
+        }
+        Jx[EFF_JOINT_IDX[k]] = jx;
+        Jy[EFF_JOINT_IDX[k]] = jy;
     }
 
+    /* tip velocity = J @ qdot */
     float tvx = 0.0f, tvy = 0.0f;
     for (int j = 0; j < NUM_JOINTS; j++) {
         tvx += Jx[j] * qdot[j];
@@ -413,6 +481,10 @@ __device__ void fingertip_velocity(const float* q, const float* qdot,
 
 /* ------------------------------------------------------------------ */
 /* f_pusher: semi-implicit Euler step, modifies state[] in place       */
+/*                                                                      */
+/* Contact is computed BEFORE Euler integration so the reaction force   */
+/* modifies qddot.  This makes q_new/qdot_new depend on obj_pos —     */
+/* the signal the particle filter uses to discriminate hypotheses.      */
 /* ------------------------------------------------------------------ */
 __device__ void f_pusher(float* state, const float* action, float dt)
 {
@@ -421,27 +493,23 @@ __device__ void f_pusher(float* state, const float* action, float dt)
     float* obj_pos = state + 14;     /* [14..15] */
     float* obj_vel = state + 16;     /* [16..17] */
 
-    /* ---- Arm dynamics (diagonal mass matrix) ---- */
+    /* ---- Arm acceleration from applied torques ---- */
     float qddot[NUM_JOINTS];
     for (int j = 0; j < NUM_JOINTS; j++) {
-        float tau  = fminf(fmaxf(action[j], -ACTION_BOUND), ACTION_BOUND);
-        qddot[j]   = (tau - DAMPING * qdot[j]) / LINK_MASS;
+        float tau = fminf(fmaxf(action[j], -ACTION_BOUND), ACTION_BOUND);
+        qddot[j]  = (tau - DAMPING * qdot[j]) / LINK_MASS;
     }
 
-    /* Semi-implicit Euler */
-    float qdot_new[NUM_JOINTS], q_new[NUM_JOINTS];
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        qdot_new[j] = qdot[j] + qddot[j] * dt;
-        q_new[j]    = q[j]    + qdot_new[j] * dt;
-    }
-
-    /* ---- Contact force on object ---- */
+    /* ---- FK + Jacobian + contact (BEFORE integration) ---- */
     float tip_x, tip_y;
     forward_kinematics(q, &tip_x, &tip_y);
 
+    /* Compute Jacobian and fingertip velocity */
+    float Jx[NUM_JOINTS], Jy[NUM_JOINTS];
     float tip_vx, tip_vy;
-    fingertip_velocity(q, qdot, &tip_vx, &tip_vy);
+    planar_jacobian(q, qdot, Jx, Jy, &tip_vx, &tip_vy);
 
+    /* Contact check */
     float dx   = obj_pos[0] - tip_x;
     float dy   = obj_pos[1] - tip_y;
     float dist = sqrtf(dx * dx + dy * dy);
@@ -451,10 +519,25 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         float push_dir_x = dx * inv_dist;
         float push_dir_y = dy * inv_dist;
         float v_comp     = tip_vx * push_dir_x + tip_vy * push_dir_y;
-        v_comp           = fmaxf(v_comp, 0.0f);  /* contact can only push, not pull */
+        v_comp           = fmaxf(v_comp, 0.0f);
         float push_force = PUSH_STRENGTH * v_comp;
-        obj_vel[0]      += push_force * push_dir_x * dt;
-        obj_vel[1]      += push_force * push_dir_y * dt;
+
+        /* Force on object */
+        obj_vel[0] += push_force * push_dir_x * dt;
+        obj_vel[1] += push_force * push_dir_y * dt;
+
+        /* Newton's 3rd law: reaction on arm via J^T */
+        float rx = -push_force * push_dir_x;
+        float ry = -push_force * push_dir_y;
+        for (int j = 0; j < NUM_JOINTS; j++) {
+            qddot[j] += (Jx[j] * rx + Jy[j] * ry) / LINK_MASS;
+        }
+    }
+
+    /* ---- Semi-implicit Euler (reaction force included in qddot) ---- */
+    for (int j = 0; j < NUM_JOINTS; j++) {
+        qdot[j] = qdot[j] + qddot[j] * dt;
+        q[j]    = q[j]    + qdot[j] * dt;
     }
 
     /* ---- Object dynamics ---- */
@@ -463,12 +546,6 @@ __device__ void f_pusher(float* state, const float* action, float dt)
     obj_vel[1] *= one_minus_fric;
     obj_pos[0] += obj_vel[0] * dt;
     obj_pos[1] += obj_vel[1] * dt;
-
-    /* ---- Write updated joint state ---- */
-    for (int j = 0; j < NUM_JOINTS; j++) {
-        q[j]    = q_new[j];
-        qdot[j] = qdot_new[j];
-    }
 }
 
 /* ------------------------------------------------------------------ */

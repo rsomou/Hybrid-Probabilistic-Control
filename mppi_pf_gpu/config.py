@@ -18,7 +18,9 @@ class Config:
     # Particle Filter
     # ------------------------------------------------------------------ #
     N: int = 1000                        # number of particles
-    process_noise_std: float = 0.005     # std of process noise for joint dims (tight: arm is well-modelled)
+    process_noise_std: float = 0.0       # NO noise on joint dims during propagation — we inject
+                                         # true q/qdot every step, so joint noise is pure contamination
+                                         # that washes out the contact reaction signal
     process_noise_std_obj: float = 0.05  # std of process noise for object-state dims (loose: contact uncertain)
     obs_noise_std: float = 0.01          # likelihood std for joint dims — tight so one-step contact signal discriminates
     obs_noise_std_obj: float = 0.1       # unused with OBS_DIM=14 but kept for kernel signature
