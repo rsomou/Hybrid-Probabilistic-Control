@@ -159,21 +159,29 @@ def run(config: Config, render: bool = False):
         if ess < config.resample_threshold * config.N:
             pf.resample()
 
-        # -- Delay-aware sampling -----------------------------------------
+        # -- Delay-aware state estimate for MPPI --------------------------
         pf.inject_observation(delayed_obs)
 
         t_delay_start = time.perf_counter()
-        # sample_current propagates copies through the last d actions
-        # (action_buffer[1:] in steady state, all of action_buffer during warmup)
+        # Use PF weighted mean as a SINGLE initial state for all K MPPI
+        # rollouts.  Sampling K different particle states introduces
+        # initial-condition noise (varying obj_pos -> varying obj-target
+        # cost) that DOMINATES the action-quality signal, preventing
+        # MPPI from selecting approach-improving trajectories.
+        mean_state = pf.estimate()            # (state_dim,) numpy float32
+
         if len(action_buffer) > config.obs_delay:
             recent_actions = list(action_buffer)[1:]   # last d actions
         else:
             recent_actions = list(action_buffer)        # warmup: all we have
 
-        if len(recent_actions) > 0:
-            initial_states = pf.sample_current(mppi.K, recent_actions)
-        else:
-            initial_states = pf.sample(mppi.K)
+        # Propagate mean state through delay actions on CPU
+        for act in recent_actions:
+            mean_state = dynamics.f_numpy(mean_state, act).astype(np.float32)
+
+        # Tile the single state across all K MPPI rollout starts
+        mean_gpu = cp.asarray(mean_state[None, :], dtype=cp.float32)
+        initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
         cp.cuda.Device(config.device_id).synchronize()
         t_delay_end = time.perf_counter()
         T_pf_delay_ms = (t_delay_end - t_delay_start) * 1e3
