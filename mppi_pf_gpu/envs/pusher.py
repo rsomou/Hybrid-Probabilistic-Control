@@ -54,8 +54,8 @@ from dynamics import AnalyticalDynamics
 NUM_JOINTS     = 7
 DAMPING        = 0.1        # joint velocity damping coefficient
 LINK_MASS      = 1.0        # diagonal mass approximation (kg)
-CONTACT_RADIUS = 0.06       # metres — fingertip contact sphere
-PUSH_STRENGTH  = 5.0        # N / (m/s) — impulse scaling
+CONTACT_RADIUS = 0.17       # metres — enlarged contact zone so PF can detect proximity
+PUSH_STRENGTH  = 20.0       # N / (m/s) — strong enough for reaction signal to exceed obs_noise
 FRICTION       = 0.2        # object sliding friction coefficient
 
 # --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) ---
@@ -311,9 +311,11 @@ class PusherDynamics(AnalyticalDynamics):
 
         PARTIAL OBSERVABILITY (Option 1):
         The true object position obs[17:19] is NOT used.  Instead, object
-        positions are sampled from the Pusher-v5 starting-state prior:
-          x ~ Uniform(-0.3, 0.0)
-          y ~ Uniform(-0.2, 0.2)
+        positions are sampled from the Pusher-v5 starting-state prior
+        in WORLD FRAME coordinates.  The MJCF body origin is (0.45, -0.05)
+        and slide joints are offset by U[-0.3, 0] x U[-0.2, 0.2], so:
+          x ~ Uniform(0.15, 0.45)
+          y ~ Uniform(-0.25, 0.15)
         This ensures the PF never peeks at the hidden object position.
 
         Joint angles and velocities ARE observable (obs[0:14]).
@@ -337,10 +339,11 @@ class PusherDynamics(AnalyticalDynamics):
         particles[:, 0:7]  = np.tile(q.astype(np.float32),    (N, 1))
         particles[:, 7:14] = np.tile(qdot.astype(np.float32), (N, 1))
 
-        # Object position: sample from Pusher-v5 initial prior (NOT from obs)
-        #   x ~ Uniform(-0.3, 0.0),  y ~ Uniform(-0.2, 0.2)
-        particles[:, 14] = np.random.uniform(-0.3, 0.0, N).astype(np.float32)
-        particles[:, 15] = np.random.uniform(-0.2, 0.2, N).astype(np.float32)
+        # Object position: sample from Pusher-v5 initial prior in WORLD FRAME.
+        # MJCF body origin (0.45, -0.05) + slide offset U[-0.3,0] x U[-0.2,0.2]
+        #   x ~ Uniform(0.15, 0.45),  y ~ Uniform(-0.25, 0.15)
+        particles[:, 14] = np.random.uniform(0.15, 0.45, N).astype(np.float32)
+        particles[:, 15] = np.random.uniform(-0.25, 0.15, N).astype(np.float32)
 
         # Object velocity: zero prior
         particles[:, 16:18] = 0.0
@@ -415,8 +418,8 @@ _PUSHER_CUDA_CODE = r"""
 #define OBS_DIM         14      /* q(7)+qdot(7) only — obj_pos withheld (partial obs) */
 #define DAMPING         0.1f
 #define LINK_MASS       1.0f
-#define CONTACT_RADIUS  0.06f
-#define PUSH_STRENGTH   5.0f
+#define CONTACT_RADIUS  0.17f
+#define PUSH_STRENGTH   20.0f
 #define FRICTION        0.2f
 #define ACTION_BOUND    2.0f
 

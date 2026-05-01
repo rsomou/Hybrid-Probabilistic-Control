@@ -267,10 +267,20 @@ def run(config: Config, render: bool = False):
                 f"tip→obj(injected)={inj_obj_dist:.3f}m "
                 f"contact_r={CONTACT_RADIUS}"
             )
+            # Weight diagnostics
+            w_cpu = cp.asnumpy(pf.weights)
+            w_max = w_cpu.max()
+            w_min = w_cpu[w_cpu > 0].min() if (w_cpu > 0).any() else 0.0
+            w_ratio = w_max / w_min if w_min > 0 else float('inf')
+
             print(
                 f"         particles: obj_mean=({obj_mean[0]:+.3f},{obj_mean[1]:+.3f}) "
                 f"obj_std=({obj_std[0]:.3f},{obj_std[1]:.3f}) "
                 f"n_in_contact={n_contact}/{config.N}"
+            )
+            print(
+                f"         weights: max={w_max:.6f} min={w_min:.6f} "
+                f"ratio={w_ratio:.1f} std={w_cpu.std():.6f}"
             )
             print(
                 f"         action={np.array2string(action, precision=2, separator=',')}"
