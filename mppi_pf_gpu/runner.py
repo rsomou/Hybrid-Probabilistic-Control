@@ -168,19 +168,43 @@ def run(config: Config, render: bool = False):
         # initial-condition noise (varying obj_pos -> varying obj-target
         # cost) that DOMINATES the action-quality signal, preventing
         # MPPI from selecting approach-improving trajectories.
-        mean_state = pf.estimate()            # (state_dim,) numpy float32
+        mean_gpu = pf.estimate_gpu()          # (1, state_dim) on GPU
 
         if len(action_buffer) > config.obs_delay:
             recent_actions = list(action_buffer)[1:]   # last d actions
         else:
             recent_actions = list(action_buffer)        # warmup: all we have
 
-        # Propagate mean state through delay actions on CPU
+        # Propagate mean state through delay actions ON GPU (single particle,
+        # zero noise) — avoids the ~85ms CPU RNEA bottleneck.
+        state_dim = dynamics.state_dim
+        zero_noise = cp.zeros((1, state_dim), dtype=cp.float32)
         for act in recent_actions:
-            mean_state = dynamics.f_numpy(mean_state, act).astype(np.float32)
+            act_gpu = cp.asarray(act, dtype=cp.float32)
+            pf._propagate_kernel(
+                (1,), (1,),
+                (
+                    mean_gpu,
+                    act_gpu,
+                    zero_noise,
+                    cp.float32(0.0),   # no joint noise
+                    cp.float32(0.0),   # no obj noise
+                    cp.float32(config.dt),
+                    np.int32(1),
+                ),
+            )
+
+        # Inject the most recent REAL tip position into the mean state.
+        # The analytical 2-link FK drifts up to 0.1m from the real 3D tip,
+        # causing MPPI to misjudge tip-object distance and plan poorly.
+        # obs_buffer[-1] has the latest observation (step t-1); use its
+        # real fingertip xy to correct the initial state for planning.
+        latest_obs = obs_buffer[-1] if len(obs_buffer) > 0 else obs
+        real_tip_xy = cp.asarray(latest_obs[14:16].astype(np.float32))
+        mean_gpu[0, 18] = real_tip_xy[0]
+        mean_gpu[0, 19] = real_tip_xy[1]
 
         # Tile the single state across all K MPPI rollout starts
-        mean_gpu = cp.asarray(mean_state[None, :], dtype=cp.float32)
         initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
         cp.cuda.Device(config.device_id).synchronize()
         t_delay_end = time.perf_counter()

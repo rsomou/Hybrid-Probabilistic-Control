@@ -242,6 +242,17 @@ class ParticleFilter:
         mean = cp.average(self.particles, axis=0, weights=self.weights)
         return cp.asnumpy(mean).astype(np.float32)
 
+    def estimate_gpu(self) -> cp.ndarray:
+        """
+        Compute the weighted mean state estimate, returned on GPU.
+
+        Returns
+        -------
+        mean_state : cp.ndarray, shape (1, state_dim), dtype float32 — on GPU
+        """
+        mean = cp.average(self.particles, axis=0, weights=self.weights)
+        return mean.reshape(1, -1).astype(cp.float32)
+
     def sample(self, K: int) -> cp.ndarray:
         """
         Draw K state samples proportional to current weights.
