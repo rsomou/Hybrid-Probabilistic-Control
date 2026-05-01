@@ -162,13 +162,11 @@ class ParticleFilter:
 
     def update(self, obs: np.ndarray):
         """
-        Likelihood-based weight update for partially-observed Pusher-v5.
+        Likelihood-based weight update.
 
-        The PF observes only q and qdot (14 dims).  Object position is hidden,
-        so particles that predicted different obj_pos values will have diverged
-        in their predicted q/qdot (via contact forces).  This creates genuine
-        likelihood differences — the PF can discriminate particles based on
-        how well their arm state prediction matches the measured arm state.
+        PF observation is [q(7), qdot(7), obj_pos(2)] = 16 dims.
+        Joint dims use tight obs_noise_std; object dims use looser
+        obs_noise_std_obj so the PF can converge on the true object position.
 
         Parameters
         ----------

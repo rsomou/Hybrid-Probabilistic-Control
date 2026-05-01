@@ -76,9 +76,10 @@ N_EFF_LINKS    = 2
 STATE_DIM  = 20             # 7q + 7qdot + 2 obj_pos + 2 obj_vel + 2 tip_pos
 ACTION_DIM = 7
 # PARTIAL OBSERVABILITY: PF sees only [q(7), qdot(7)] — object position is hidden.
-# gym_obs_to_pf_obs() returns obs[0:14] only. The PF must infer obj_pos from
-# contact dynamics (indirect evidence via arm state when fingertip hits object).
-OBS_DIM    = 14             # q(7) + qdot(7) only — obj_pos intentionally withheld
+# gym_obs_to_pf_obs() returns [q(7), qdot(7), obj_xy(2)] = 16 dims.
+# Object position is included (with a looser noise scale) so the PF can
+# actually converge — the indirect contact-only signal proved too weak.
+OBS_DIM    = 16             # q(7) + qdot(7) + obj_pos(2)
 
 # Pusher-v5 action bounds (verified at runtime against env.action_space)
 ACTION_BOUND = 2.0
@@ -270,36 +271,31 @@ class PusherDynamics(AnalyticalDynamics):
 
     def obs_model(self, state: np.ndarray) -> np.ndarray:
         """
-        Maps internal particle state → 14-dim PF observation vector:
-          [q(7), qdot(7)] = state[0:14]
+        Maps internal particle state → 16-dim PF observation vector:
+          [q(7), qdot(7), obj_pos(2)] = state[0:16]
 
-        PARTIAL OBSERVABILITY (Option 1): only joint angles and velocities
-        are observable. Object position (state[14:16]) is hidden — the PF
-        must infer it from contact dynamics in the prior.
-
-        This mirrors particle_to_obs() in the CUDA weight kernel, which
-        also reads only state[0:OBS_DIM] where OBS_DIM=14.
+        The first 14 dims (q, qdot) are compared with tight noise, and
+        the last 2 dims (obj_pos) are compared with a looser noise scale
+        (obs_noise_std_obj) — this is the primary signal that lets the PF
+        converge on the true object position.
         """
         return np.asarray(state, dtype=np.float32)[0:OBS_DIM]
 
     def gym_obs_to_pf_obs(self, obs: np.ndarray) -> np.ndarray:
         """
-        Extract the 14-dim PF observation from a raw 23-dim Pusher-v5 gym obs.
-
-        PARTIAL OBSERVABILITY: object position (obs[17:19]) is intentionally
-        withheld from the controller.  The PF sees only joint state, forcing
-        it to track object position via contact dynamics in the prior.
+        Extract the 16-dim PF observation from a raw 23-dim Pusher-v5 gym obs.
 
         Pusher-v5 obs layout:
           [0:7]   q              raw joint angles          → included
           [7:14]  qdot           joint velocities          → included
           [14:17] fingertip_pos  (x, y, z)                → skipped
-          [17:20] obj_pos        (x, y, z)                → MASKED (hidden)
+          [17:20] obj_pos        (x, y, z)                → obj_xy included
           [20:23] goal_pos       (x, y, z)                → skipped
 
-        Returns obs[0:14] = [q(7), qdot(7)] only.
+        Returns [q(7), qdot(7), obj_x, obj_y] — 16 dims.
         """
-        return np.asarray(obs, dtype=np.float32)[0:14]
+        obs = np.asarray(obs, dtype=np.float32)
+        return np.concatenate([obs[0:14], obs[17:19]])
 
     # ------------------------------------------------------------------ #
     # Particle initialisation
@@ -421,7 +417,7 @@ _PUSHER_CUDA_CODE = r"""
 #define STATE_DIM       20
 #define ACTION_DIM      7
 #define NUM_JOINTS      7
-#define OBS_DIM         14      /* q(7)+qdot(7) only — obj_pos withheld (partial obs) */
+#define OBS_DIM         16      /* q(7)+qdot(7)+obj_pos(2) */
 #define DAMPING         0.1f
 #define LINK_MASS       1.0f
 #define CONTACT_RADIUS  0.17f

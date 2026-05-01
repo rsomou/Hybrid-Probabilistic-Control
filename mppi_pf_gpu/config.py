@@ -25,7 +25,8 @@ class Config:
                                          # explore ≈ 0.17m over 300 steps (0.01 * sqrt(300) ≈ 0.17m)
                                          # while staying tight enough that resampled particles don't drift far
     obs_noise_std: float = 0.01          # likelihood std for joint dims — tight so one-step contact signal discriminates
-    obs_noise_std_obj: float = 0.1       # unused with OBS_DIM=14 but kept for kernel signature
+    obs_noise_std_obj: float = 0.05      # likelihood std for object position dims — looser than joint dims
+                                         # to account for the PF's approximate dynamics model
     inject_noise_std: float = 0.001      # jitter added when injecting true q/qdot into particles
     resample_threshold: float = 0.5      # resample only when ESS < threshold * N
 

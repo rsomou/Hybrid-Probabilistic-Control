@@ -162,31 +162,26 @@ void pf_propagate(
 # Computes log-likelihood of each particle given the current observation and
 # multiplies the existing weight (in log-sum-exp fashion via direct product).
 #
-# PARTIAL OBSERVABILITY: PF obs layout (OBS_DIM = 14) — only arm state:
-#   [0:7]   q      — raw joint angles   (gym obs[0:7])
-#   [7:14]  qdot   — joint velocities   (gym obs[7:14])
+# PF obs layout (OBS_DIM = 16):
+#   [0:7]   q        — raw joint angles   (gym obs[0:7])
+#   [7:14]  qdot     — joint velocities   (gym obs[7:14])
+#   [14:16] obj_pos  — object xy          (gym obs[17:19])
 #
-# Object position (gym obs[17:19]) is deliberately withheld.  The PF must
-# infer obj_pos from the prior propagated through contact dynamics.  This
-# creates genuine likelihood differences: particles whose obj_pos diverged
-# will have had different contact forces → different predicted q/qdot.
+# Particle state layout (STATE_DIM = 20):
+#   [0:7]   q        state[0:7]   ← compared to obs[0:7]
+#   [7:14]  qdot     state[7:14]  ← compared to obs[7:14]
+#   [14:16] obj_pos  state[14:16] ← compared to obs[14:16]
+#   [16:18] obj_vel  state[16:18] ← not observed
+#   [18:20] tip_pos  state[18:20] ← not observed
 #
-# Particle state layout (STATE_DIM = 18):
-#   [0:7]   q        state[0:7]   ← compared to obs
-#   [7:14]  qdot     state[7:14]  ← compared to obs
-#   [14:16] obj_pos  state[14:16] ← hidden from obs; inferred by PF
-#   [16:18] obj_vel  state[16:18] ← hidden; propagated by dynamics
-#
-# KEY: predicted_obs[d] == state[d] for d=0..13 — direct state lookup.
-# Only one noise scale needed (all OBS_DIM=14 dims are joint dims):
-#   obs_noise_std  — q/qdot tolerance matching simplified dynamics error
-#   obs_noise_std_obj — kept in signature but unreachable (d < 14 always)
+# Two noise scales:
+#   obs_noise_std      — tight, for joint dims d < 14
+#   obs_noise_std_obj  — looser, for obj_pos dims d >= 14
 # --------------------------------------------------------------------------- #
 PF_WEIGHT_UPDATE_KERNEL = r"""
 /* Extract the d-th predicted observation for particle i.
-   PF obs is [q(0..6), qdot(7..13)] — OBS_DIM=14 (partial observability).
-   Object position is NOT in the observation; it is hidden from the PF.
-   particle state[d] for d=0..13 maps directly to obs[d].
+   PF obs is [q(0..6), qdot(7..13), obj_x(14), obj_y(15)] — OBS_DIM=16.
+   particle state[d] for d=0..15 maps directly to obs[d].
 */
 __device__ float particle_to_obs(const float* particles, int i, int d)
 {
@@ -206,18 +201,21 @@ void pf_weight_update(
     if (i >= N) return;
 
     float inv_var_joint = 1.0f / (obs_noise_std * obs_noise_std);
+    float inv_var_obj   = 1.0f / (obs_noise_std_obj * obs_noise_std_obj);
     float log_lik       = 0.0f;
 
-    // Compare predicted vs actual observation for all OBS_DIM components.
-    // With OBS_DIM=14 all dims are joint q/qdot — only inv_var_joint is used.
-    // obs_noise_std_obj is kept in the signature for forward-compatibility but
-    // is intentionally unused here (partial observability hides object state).
-    (void)obs_noise_std_obj;  // suppress unused-parameter warning
+    // Joint dims: q and qdot (d = 0..13) — tight noise scale
+    for (int d = 0; d < 2 * NUM_JOINTS; d++) {
+        float pred = particle_to_obs(particles, i, d);
+        float diff = pred - observation[d];
+        log_lik   -= 0.5f * diff * diff * inv_var_joint;
+    }
 
-    for (int d = 0; d < OBS_DIM; d++) {
-        float pred    = particle_to_obs(particles, i, d);
-        float diff    = pred - observation[d];
-        log_lik      -= 0.5f * diff * diff * inv_var_joint;
+    // Object position dims (d = 14..15) — looser noise scale
+    for (int d = 2 * NUM_JOINTS; d < OBS_DIM; d++) {
+        float pred = particle_to_obs(particles, i, d);
+        float diff = pred - observation[d];
+        log_lik   -= 0.5f * diff * diff * inv_var_obj;
     }
 
     weights[i] *= expf(log_lik);
