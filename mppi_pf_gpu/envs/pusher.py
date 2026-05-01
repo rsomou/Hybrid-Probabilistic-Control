@@ -58,20 +58,10 @@ FRICTION       = 0.2        # object sliding friction coefficient
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
-# --- Effective planar FK geometry (from MuJoCo Pusher-v5 MJCF) ---
-# The real arm is 3D, but operates mostly in the XY plane (gravity=0).
-# The Gymnasium obs "fingertip" (get_body_com("tips_arm")) is at the
-# WRIST body frame, NOT 0.1m past it.  Verified: at q=0 real tip =
-# (0.821, -0.6) = base + 0.5 + 0.321, confirming 2-link model.
-#
-# Effective 2-link chain in XY (used only for FK during MPPI rollouts):
-#   link 0: shoulder → elbow  = 0.1 + 0.4 = 0.5m  (rotated by q[0])
-#   link 1: elbow → wrist     = 0.321m             (rotated by q[0]+q[3])
-BASE_X         = 0.0
-BASE_Y         = -0.6
-EFF_LINK_LENGTHS = [0.5, 0.321]          # metres
-EFF_JOINT_INDICES = [0, 3]               # which q[] indices affect XY FK
-N_EFF_LINKS    = 2
+# --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
+# The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
+# Full 7-DOF FK uses JOINT_AXES, JOINT_OFFSETS, and this base.
+ARM_BASE = np.array([0.0, -0.6, 0.0], dtype=np.float64)
 
 STATE_DIM  = 20             # 7q + 7qdot + 2 obj_pos + 2 obj_vel + 2 tip_pos
 ACTION_DIM = 7
@@ -326,54 +316,58 @@ class PusherDynamics(AnalyticalDynamics):
     @staticmethod
     def _forward_kinematics(q: np.ndarray):
         """
-        Compute fingertip (x, y) using the effective 3-link planar model.
+        Compute fingertip (x, y) using full 7-DOF forward kinematics.
 
-        Only joints 0, 3, 5 affect the XY plane position (the others are
-        lift/roll joints that mostly change Z).
+        Chains all 7 joint transforms using the same rotation matrices
+        and link offsets as the RNEA implementation.
 
         Returns
         -------
         tip_x, tip_y : float
-            Fingertip position in the planar workspace.
+            Fingertip position in the world frame.
         """
-        tip_x = BASE_X
-        tip_y = BASE_Y
-        cumulative_angle = 0.0
-        for k in range(N_EFF_LINKS):
-            cumulative_angle += q[EFF_JOINT_INDICES[k]]
-            tip_x += EFF_LINK_LENGTHS[k] * np.cos(cumulative_angle)
-            tip_y += EFF_LINK_LENGTHS[k] * np.sin(cumulative_angle)
-        return tip_x, tip_y
+        pos = ARM_BASE.copy()
+        R_cum = np.eye(3, dtype=np.float64)
+        for i in range(NUM_JOINTS):
+            pos = pos + R_cum @ JOINT_OFFSETS[i]
+            R_cum = R_cum @ _rotation_matrix(JOINT_AXES[i], q[i])
+        return float(pos[0]), float(pos[1])
 
     @staticmethod
     def _planar_jacobian(q: np.ndarray):
         """
-        Compute the 2×7 Jacobian mapping qdot → fingertip velocity in XY.
+        Compute the 2×7 positional Jacobian mapping qdot → fingertip XY velocity
+        using full 7-DOF kinematics.
 
-        Only the effective joints have non-zero columns.
-        Returns J_x, J_y as (7,) arrays (zero for non-effective joints).
+        For revolute joint i: J_i = z_i × (p_tip − p_i)  (3D cross product)
+        where z_i is the joint axis in world frame, p_i is joint i origin.
+        We extract the x and y rows.
+
+        Returns J_x, J_y as (7,) arrays.
         """
+        # Forward pass: compute joint origins and world-frame axes
+        positions = np.zeros((NUM_JOINTS, 3), dtype=np.float64)
+        axes_w    = np.zeros((NUM_JOINTS, 3), dtype=np.float64)
+        pos = ARM_BASE.copy()
+        R_cum = np.eye(3, dtype=np.float64)
+        for i in range(NUM_JOINTS):
+            pos = pos + R_cum @ JOINT_OFFSETS[i]
+            positions[i] = pos
+            axes_w[i] = R_cum @ JOINT_AXES[i]
+            R_cum = R_cum @ _rotation_matrix(JOINT_AXES[i], q[i])
+        # tip position = pos at end of loop (after all offsets, last rotation
+        # doesn't add position since there's no offset past joint 6)
+        tip = pos.copy()
+
         J_x = np.zeros(NUM_JOINTS, dtype=np.float64)
         J_y = np.zeros(NUM_JOINTS, dtype=np.float64)
-
-        # Cumulative angle at each effective link end
-        cum_angles = np.zeros(N_EFF_LINKS)
-        a = 0.0
-        for k in range(N_EFF_LINKS):
-            a += q[EFF_JOINT_INDICES[k]]
-            cum_angles[k] = a
-
-        # For effective joint k, its column in J is the sum of
-        # -L_m * sin(cum_m) / +L_m * cos(cum_m) for all m >= k
-        for k in range(N_EFF_LINKS):
-            jx = 0.0
-            jy = 0.0
-            for m in range(k, N_EFF_LINKS):
-                jx += -EFF_LINK_LENGTHS[m] * np.sin(cum_angles[m])
-                jy +=  EFF_LINK_LENGTHS[m] * np.cos(cum_angles[m])
-            j_idx = EFF_JOINT_INDICES[k]
-            J_x[j_idx] = jx
-            J_y[j_idx] = jy
+        for i in range(NUM_JOINTS):
+            r = tip - positions[i]
+            # cross product: z_i × r
+            cx = axes_w[i, 1] * r[2] - axes_w[i, 2] * r[1]
+            cy = axes_w[i, 2] * r[0] - axes_w[i, 0] * r[2]
+            J_x[i] = cx
+            J_y[i] = cy
 
         return J_x, J_y
 
@@ -655,12 +649,10 @@ def _generate_cuda_code():
         "#define N_SUBSTEPS      5\n"
         "#define INNER_DT        0.01f\n"
         f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n\n"
-        "/* Effective 2-link planar FK (unchanged) */\n"
-        "#define BASE_X  0.0f\n"
-        "#define BASE_Y -0.6f\n"
-        "#define N_EFF_LINKS 2\n"
-        "__device__ const int   EFF_JOINT_IDX[2] = {0, 3};\n"
-        "__device__ const float EFF_LINK_LEN[2]  = {0.5f, 0.321f};\n\n"
+        "/* Arm base position in world frame */\n"
+        "#define ARM_BASE_X  0.0f\n"
+        "#define ARM_BASE_Y -0.6f\n"
+        "#define ARM_BASE_Z  0.0f\n\n"
         "/* ---- RNEA link parameters (auto-generated from MJCF geoms) ---- */\n"
         f"__device__ const float JOINT_AXES_D[7][3]    = {{{_fmt2d(JOINT_AXES)}}};\n"
         f"__device__ const float JOINT_OFFSETS_D[7][3]  = {{{_fmt2d(JOINT_OFFSETS)}}};\n"
@@ -824,39 +816,93 @@ __device__ void chol_solve7(float* A, const float* b, float* x) {
 }
 
 /* ================================================================== */
-/*  Forward kinematics (effective 2-link planar, unchanged)            */
+/*  Full 7-DOF Forward Kinematics                                      */
+/*  Chains all joint transforms: T = prod_i translate(offset_i) *       */
+/*  rotate(axis_i, q_i).  Returns tip (x, y) in world frame.           */
 /* ================================================================== */
 __device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y) {
-    float cx = BASE_X, cy = BASE_Y, angle = 0.0f;
-    for (int k = 0; k < N_EFF_LINKS; k++) {
-        angle += q[EFF_JOINT_IDX[k]];
-        cx += EFF_LINK_LEN[k] * cosf(angle);
-        cy += EFF_LINK_LEN[k] * sinf(angle);
+    float pos[3] = {ARM_BASE_X, ARM_BASE_Y, ARM_BASE_Z};
+    float R[9] = {1,0,0, 0,1,0, 0,0,1};  /* cumulative rotation, row-major */
+
+    for (int i = 0; i < NUM_JOINTS; i++) {
+        /* pos += R @ offset[i] */
+        float ox = JOINT_OFFSETS_D[i][0], oy = JOINT_OFFSETS_D[i][1], oz = JOINT_OFFSETS_D[i][2];
+        pos[0] += R[0]*ox + R[1]*oy + R[2]*oz;
+        pos[1] += R[3]*ox + R[4]*oy + R[5]*oz;
+        pos[2] += R[6]*ox + R[7]*oy + R[8]*oz;
+
+        /* R_joint = rotation(axis[i], q[i]) */
+        float Rj[9];
+        rot_aa(JOINT_AXES_D[i], q[i], Rj);
+
+        /* R = R @ Rj */
+        float tmp[9];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+                tmp[r*3+c] = R[r*3+0]*Rj[0*3+c] + R[r*3+1]*Rj[1*3+c] + R[r*3+2]*Rj[2*3+c];
+        for (int k = 0; k < 9; k++) R[k] = tmp[k];
     }
-    *tip_x = cx;  *tip_y = cy;
+    *tip_x = pos[0];
+    *tip_y = pos[1];
 }
 
 /* ================================================================== */
-/*  Planar Jacobian (unchanged)                                        */
+/*  Full 7-DOF Positional Jacobian (XY rows)                           */
+/*  J_i = z_i x (p_tip - p_i), where z_i = world-frame joint axis     */
 /* ================================================================== */
 __device__ void planar_jacobian(const float* q, const float* qdot,
                                 float* Jx, float* Jy,
                                 float* vx, float* vy)
 {
-    for (int j=0;j<NUM_JOINTS;j++){Jx[j]=0.0f;Jy[j]=0.0f;}
-    float cum[N_EFF_LINKS]; float a=0.0f;
-    for (int k=0;k<N_EFF_LINKS;k++){a+=q[EFF_JOINT_IDX[k]];cum[k]=a;}
-    for (int k=0;k<N_EFF_LINKS;k++){
-        float jx=0.0f,jy=0.0f;
-        for (int m=k;m<N_EFF_LINKS;m++){
-            jx += -EFF_LINK_LEN[m]*sinf(cum[m]);
-            jy +=  EFF_LINK_LEN[m]*cosf(cum[m]);
-        }
-        Jx[EFF_JOINT_IDX[k]]=jx; Jy[EFF_JOINT_IDX[k]]=jy;
+    /* Forward pass: compute joint origins and world-frame axes */
+    float positions[7][3];
+    float axes_w[7][3];
+    float pos[3] = {ARM_BASE_X, ARM_BASE_Y, ARM_BASE_Z};
+    float R[9] = {1,0,0, 0,1,0, 0,0,1};
+
+    for (int i = 0; i < NUM_JOINTS; i++) {
+        /* pos += R @ offset[i] */
+        float ox = JOINT_OFFSETS_D[i][0], oy = JOINT_OFFSETS_D[i][1], oz = JOINT_OFFSETS_D[i][2];
+        pos[0] += R[0]*ox + R[1]*oy + R[2]*oz;
+        pos[1] += R[3]*ox + R[4]*oy + R[5]*oz;
+        pos[2] += R[6]*ox + R[7]*oy + R[8]*oz;
+        positions[i][0] = pos[0];
+        positions[i][1] = pos[1];
+        positions[i][2] = pos[2];
+
+        /* axis in world = R @ JOINT_AXES[i] */
+        float ax = JOINT_AXES_D[i][0], ay = JOINT_AXES_D[i][1], az = JOINT_AXES_D[i][2];
+        axes_w[i][0] = R[0]*ax + R[1]*ay + R[2]*az;
+        axes_w[i][1] = R[3]*ax + R[4]*ay + R[5]*az;
+        axes_w[i][2] = R[6]*ax + R[7]*ay + R[8]*az;
+
+        /* R = R @ Rj */
+        float Rj[9];
+        rot_aa(JOINT_AXES_D[i], q[i], Rj);
+        float tmp[9];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++)
+                tmp[r*3+c] = R[r*3+0]*Rj[0*3+c] + R[r*3+1]*Rj[1*3+c] + R[r*3+2]*Rj[2*3+c];
+        for (int k = 0; k < 9; k++) R[k] = tmp[k];
     }
-    float tvx=0.0f,tvy=0.0f;
-    for (int j=0;j<NUM_JOINTS;j++){tvx+=Jx[j]*qdot[j];tvy+=Jy[j]*qdot[j];}
-    *vx=tvx; *vy=tvy;
+    /* tip = pos (after all offsets applied) */
+    float tip[3] = {pos[0], pos[1], pos[2]};
+
+    /* Jacobian: J_i = z_i x (tip - p_i) */
+    float tvx = 0.0f, tvy = 0.0f;
+    for (int i = 0; i < NUM_JOINTS; i++) {
+        float rx = tip[0] - positions[i][0];
+        float ry = tip[1] - positions[i][1];
+        float rz = tip[2] - positions[i][2];
+        /* cross product x-component: z_y * r_z - z_z * r_y */
+        Jx[i] = axes_w[i][1]*rz - axes_w[i][2]*ry;
+        /* cross product y-component: z_z * r_x - z_x * r_z */
+        Jy[i] = axes_w[i][2]*rx - axes_w[i][0]*rz;
+        tvx += Jx[i] * qdot[i];
+        tvy += Jy[i] * qdot[i];
+    }
+    *vx = tvx;
+    *vy = tvy;
 }
 
 /* ================================================================== */
