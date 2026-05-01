@@ -36,7 +36,7 @@ class Config:
     K: int = 1024                    # number of trajectory samples
     H: int = 30                      # planning horizon
     lambda_: float = 1.0             # temperature parameter
-    sigma: float = 0.5               # perturbation std
+    sigma: float = 0.8               # perturbation std (increased for better joint exploration)
 
     # ------------------------------------------------------------------ #
     # Observation Delay

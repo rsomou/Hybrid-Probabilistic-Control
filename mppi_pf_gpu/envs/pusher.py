@@ -58,9 +58,10 @@ FRICTION       = 0.2        # object sliding friction coefficient
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
-# --- Z-height incentive for lowering the fingertip to the table plane ---
-TABLE_Z        = -0.275     # z-height of the object on the table (from MJCF body pos)
-Z_COST_WEIGHT  = 5.0        # weight on (tip_z - TABLE_Z)^2 in running cost
+# --- Z-height and approach cost parameters ---
+TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
+APPROACH_WEIGHT    = 2.0     # weight on 3-D tip-to-object distance (FK-based, includes z)
+ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2 (reduced to allow aggressive bending)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -455,39 +456,34 @@ class PusherDynamics(AnalyticalDynamics):
 
     def cost_numpy(self, state: np.ndarray, action: np.ndarray) -> float:
         """
-        Running cost matching the Pusher-v5 reward (negated for minimisation),
-        plus a z-height penalty to encourage lowering the fingertip to the
-        table plane so actual contact can occur in the 3-D simulator.
+        Running cost with 3-D approach term.  Uses FK to get the full
+        (x, y, z) fingertip position and measures 3-D distance to the
+        object at (obj_x, obj_y, TABLE_Z).  This creates a unified
+        gradient that bends joints to both approach AND descend.
 
-        Pusher-v5 reward:
-          reward_near = -0.5 * ||fingertip - obj_pos||
-          reward_dist = -1.0 * ||obj_pos   - goal_pos||
-          reward_ctrl = -0.1 * ||action||^2
-
-        cost = -reward = 0.5 * ||fingertip - obj_pos||
-                       + 1.0 * ||obj_pos   - target_pos||
-                       + 0.1 * ||action||^2
-                       + Z_COST_WEIGHT * (tip_z - TABLE_Z)^2
+        cost = APPROACH_WEIGHT * ||tip_3d - obj_3d||
+             + 1.0 * ||obj_xy - target_xy||
+             + ACTION_COST_WEIGHT * ||action||^2
         """
         state  = np.asarray(state, dtype=np.float64)
         action = np.asarray(action, dtype=np.float64)
 
         obj_pos = state[14:16]
-        tip_pos = state[18:20]           # use stored tip position
 
-        dist_tip_obj    = np.linalg.norm(tip_pos - obj_pos)
+        # Full 3-D fingertip position via FK
+        fk_x, fk_y, fk_z = self._forward_kinematics(state[0:7])
+
+        # 3-D tip-to-object distance (object z at table height)
+        d_approach = np.sqrt((fk_x - obj_pos[0])**2
+                           + (fk_y - obj_pos[1])**2
+                           + (fk_z - TABLE_Z)**2)
+
         dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
         action_cost     = float(np.dot(action, action))
 
-        # Z-height penalty: compute tip_z from FK and penalise deviation
-        # from the table plane so the planner drives the arm downward.
-        _tx, _ty, tip_z = self._forward_kinematics(state[0:7])
-        z_err = tip_z - TABLE_Z
-
-        return (0.5 * dist_tip_obj
+        return (APPROACH_WEIGHT * d_approach
                 + 1.0 * dist_obj_target
-                + 0.1 * action_cost
-                + Z_COST_WEIGHT * z_err * z_err)
+                + ACTION_COST_WEIGHT * action_cost)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -663,7 +659,8 @@ def _generate_cuda_code():
         "#define INNER_DT        0.01f\n"
         f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n"
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
-        f"#define Z_COST_WEIGHT   {Z_COST_WEIGHT:.6f}f\n\n"
+        f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
+        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -990,34 +987,38 @@ __device__ void f_pusher(float* state, const float* action, float dt)
 }
 
 /* ================================================================== */
-/*  cost_pusher: running cost with z-height penalty                     */
-/*  The z-height term encourages the planner to lower the fingertip    */
-/*  to the table plane so that real 3-D contact can occur.             */
+/*  cost_pusher: 3-D approach cost that unifies xy-reach and z-lower   */
+/*  Uses FK to get fingertip (x,y,z) and measures full 3-D distance    */
+/*  to object at (obj_x, obj_y, TABLE_Z).  This creates a single      */
+/*  gradient that bends joints to both approach AND descend.           */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target)
 {
     const float* obj_pos = state + 14;
-    const float* tip_pos = state + 18;
-    float dx1=tip_pos[0]-obj_pos[0], dy1=tip_pos[1]-obj_pos[1];
-    float d1 = sqrtf(dx1*dx1+dy1*dy1);
-    float dx2=obj_pos[0]-target[0], dy2=obj_pos[1]-target[1];
-    float d2 = sqrtf(dx2*dx2+dy2*dy2);
-    float act2=0.0f;
-    for (int a=0;a<ACTION_DIM;a++) act2+=action[a]*action[a];
 
-    /* Z-height penalty: compute fingertip z via FK from joint angles
-       and penalise deviation from the table plane (TABLE_Z).  This is
-       the key signal that makes the planner lower the arm so that
-       real 3-D contact with the object is possible. */
+    /* Full 3-D fingertip position via FK */
     float fk_x, fk_y, fk_z;
     forward_kinematics(state, &fk_x, &fk_y, &fk_z);
-    float z_err = fk_z - TABLE_Z;
 
-    // Matched to Pusher-v5 gym reward (negated for minimisation):
-    //   reward = -0.5*||tip-obj|| - 1.0*||obj-goal|| - 0.1*||action||^2
-    //   + z-height penalty to drive the arm to the correct height
-    return 0.5f*d1 + 1.0f*d2 + 0.1f*act2 + Z_COST_WEIGHT*z_err*z_err;
+    /* 3-D tip-to-object distance (object z assumed at table height) */
+    float dx = fk_x - obj_pos[0];
+    float dy = fk_y - obj_pos[1];
+    float dz = fk_z - TABLE_Z;
+    float d_approach = sqrtf(dx*dx + dy*dy + dz*dz);
+
+    /* 2-D object-to-target distance (z irrelevant) */
+    float dx2 = obj_pos[0] - target[0];
+    float dy2 = obj_pos[1] - target[1];
+    float d_target = sqrtf(dx2*dx2 + dy2*dy2);
+
+    /* Action cost */
+    float act2 = 0.0f;
+    for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
+
+    return APPROACH_WEIGHT * d_approach
+         + 1.0f * d_target
+         + ACTION_COST_WEIGHT * act2;
 }
 """
 
