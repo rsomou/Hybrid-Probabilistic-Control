@@ -60,14 +60,14 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 
 # --- Z-height and approach cost parameters ---
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
-APPROACH_WEIGHT    = 3.0     # weight on horizontal 2-D tip-to-object distance (XY only)
+APPROACH_WEIGHT    = 8.0     # weight on horizontal 2-D tip-to-object distance (XY only)
 Z_COST_WEIGHT      = 5.0     # weight on (tip_z - TABLE_Z) when arm is above table plane
 FLOOR_WEIGHT       = 30.0    # penalty for arm going BELOW table plane (mirrors MuJoCo table constraint)
 ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2 — kept small so multi-joint actions are not suppressed
 TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
 CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
-CONTACT_SCALE      = 0.15    # length-scale of funnel (≈ contact radius); gradient ∝ BONUS/SCALE
-REACH_WEIGHT       = 4.0     # penalty for arm horizontal reach > base-to-object distance (elbow-fold signal)
+CONTACT_SCALE      = 0.25    # length-scale of funnel; wider = stronger gradient at 0.28m stall distance
+REACH_WEIGHT       = 0.5     # reduced: joint limits now prevent elbow abuse; high weight was fighting approach
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -496,12 +496,16 @@ class PusherDynamics(AnalyticalDynamics):
 
         obj_pos = state[14:16]
 
-        # 1. Horizontal tip-to-object distance (XY only)
+        # 1. Full 3-D tip-to-object distance.
+        # The object sits at TABLE_Z in Z, so target position is (obj_x, obj_y, TABLE_Z).
+        # Using 3D distance ensures MPPI simultaneously drives XY approach AND Z descent;
+        # a 2D-only cost leaves Z under-constrained and the arm hovers above the table.
         fk_x, fk_y, fk_z = self._forward_kinematics(state[0:7])
-        d_horiz = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2)
+        dz_approach = fk_z - TABLE_Z   # signed; positive when arm above table
+        d_3d = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2 + dz_approach**2)
 
-        # 2. Z-lowering: penalise arm above table plane
-        dz = max(fk_z - TABLE_Z, 0.0)
+        # 2. Extra above-table penalty (reinforces Z descent on top of 3D approach gradient)
+        dz = max(dz_approach, 0.0)
 
         # 2b. Floor constraint: penalise arm going BELOW table plane.
         # MuJoCo's table geometry physically blocks the arm from going below
@@ -523,8 +527,8 @@ class PusherDynamics(AnalyticalDynamics):
         # 5. Action regularisation
         action_cost = float(np.dot(action, action))
 
-        return (APPROACH_WEIGHT    * d_horiz
-                - CONTACT_BONUS    * np.exp(-d_horiz / CONTACT_SCALE)
+        return (APPROACH_WEIGHT    * d_3d
+                - CONTACT_BONUS    * np.exp(-d_3d / CONTACT_SCALE)
                 + Z_COST_WEIGHT    * dz
                 + FLOOR_WEIGHT     * floor_violation
                 + REACH_WEIGHT     * overextension
@@ -1068,13 +1072,18 @@ __device__ float cost_pusher(const float* state, const float* action,
     float fk_x, fk_y, fk_z;
     forward_kinematics(state, &fk_x, &fk_y, &fk_z);
 
-    /* ---- 1. Horizontal tip-to-object distance (XY only) ---- */
+    /* ---- 1. Full 3-D tip-to-object distance.
+     * Object sits at TABLE_Z in Z, so target = (obj_x, obj_y, TABLE_Z).
+     * 3D distance forces MPPI to descend to table level AND close XY gap
+     * simultaneously; a 2D-only cost left Z under-constrained so the arm
+     * hovered above the table and never made real MuJoCo contact. ---- */
     float dx = fk_x - obj_pos[0];
     float dy = fk_y - obj_pos[1];
-    float d_horiz = sqrtf(dx*dx + dy*dy);
+    float dz_approach = fk_z - TABLE_Z;   /* signed — positive when arm above table */
+    float d_3d = sqrtf(dx*dx + dy*dy + dz_approach*dz_approach);
 
-    /* ---- 2. Z-lowering: only penalise arm above table plane ---- */
-    float dz = fmaxf(fk_z - TABLE_Z, 0.0f);
+    /* ---- 2. Extra above-table penalty (reinforces Z descent on top of 3D approach) ---- */
+    float dz = fmaxf(dz_approach, 0.0f);
 
     /* ---- 2b. Floor constraint: mirror MuJoCo table blocking arm below TABLE_Z.
      * Without this, MPPI plans elbow-flex trajectories that pass through the
@@ -1104,8 +1113,8 @@ __device__ float cost_pusher(const float* state, const float* action,
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
-    return APPROACH_WEIGHT * d_horiz
-         - CONTACT_BONUS   * expf(-d_horiz / CONTACT_SCALE)
+    return APPROACH_WEIGHT * d_3d
+         - CONTACT_BONUS   * expf(-d_3d / CONTACT_SCALE)
          + Z_COST_WEIGHT   * dz
          + FLOOR_WEIGHT    * floor_violation
          + REACH_WEIGHT    * overextension

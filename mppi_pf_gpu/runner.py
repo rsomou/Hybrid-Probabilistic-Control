@@ -286,7 +286,7 @@ def run(config: Config, render: bool = False, record: bool = False,
         T_env_ms   = (t_env_end - t_gpu_end)  * 1e3
         T_total_ms = (t_env_end - step_start) * 1e3
 
-        record = {
+        timing_entry = {
             "step":       t,
             "T_total_ms": T_total_ms,
             "T_gpu_ms":   T_gpu_ms,
@@ -299,7 +299,7 @@ def run(config: Config, render: bool = False, record: bool = False,
             "deadline_ms":      config.deadline_ms,
             "safety_margin_ms": config.safety_margin_ms,
         }
-        timing_log.append(record)
+        timing_log.append(timing_entry)
 
         if config.enable_timing:
             print(
@@ -319,8 +319,10 @@ def run(config: Config, render: bool = False, record: bool = False,
             anal_tip     = dynamics._forward_kinematics(q_now)  # our FK (x, y, z)
             tip_err      = np.sqrt((anal_tip[0] - real_tip[0])**2
                                    + (anal_tip[1] - real_tip[1])**2)
-            tip_obj_dist = np.sqrt((real_tip[0] - real_obj[0])**2
-                                   + (real_tip[1] - real_obj[1])**2)
+            # 2D XY distance and full 3D distance (obj z ≈ TABLE_Z = -0.275)
+            tip_obj_dist    = np.sqrt((real_tip[0] - real_obj[0])**2
+                                     + (real_tip[1] - real_obj[1])**2)
+            tip_obj_dist_3d = float(np.linalg.norm(real_tip - real_obj))
 
             if not no_pf:
                 # Check how many particles have obj_pos within contact radius
@@ -338,8 +340,8 @@ def run(config: Config, render: bool = False, record: bool = False,
                 f"FK_err={tip_err:.4f}m"
             )
             print(
-                f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
-                f"tip→obj(real)={tip_obj_dist:.3f}m "
+                f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f},{real_obj[2]:+.3f}) "
+                f"tip→obj_xy={tip_obj_dist:.3f}m  tip→obj_3d={tip_obj_dist_3d:.3f}m "
                 f"contact_r={CONTACT_RADIUS}"
             )
             if not no_pf:
