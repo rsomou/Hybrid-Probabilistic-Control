@@ -62,7 +62,7 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
 APPROACH_WEIGHT    = 3.0     # weight on horizontal 2-D tip-to-object distance (XY only)
 Z_COST_WEIGHT      = 5.0     # weight on (tip_z - TABLE_Z) when arm is above table plane
-ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2
+ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2 — kept small so multi-joint actions are not suppressed
 TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
 CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
 CONTACT_SCALE      = 0.15    # length-scale of funnel (≈ contact radius); gradient ∝ BONUS/SCALE

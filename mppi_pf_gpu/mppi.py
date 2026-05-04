@@ -50,6 +50,13 @@ class MPPI:
         self.action_low  = cp.asarray(dynamics.action_low,  dtype=cp.float32)
         self.action_high = cp.asarray(dynamics.action_high, dtype=cp.float32)
 
+        # Per-joint sigma vector — shape (action_dim,), stays on GPU
+        # Effective std for joint j = sigma * sigma_joint_weights[j]
+        self.sigma_vec: cp.ndarray = cp.asarray(
+            [w * config.sigma for w in config.sigma_joint_weights],
+            dtype=cp.float32,
+        )
+
         # Target position set once per episode via set_target()
         self.target_gpu: cp.ndarray = None
 
@@ -143,14 +150,15 @@ class MPPI:
 
         timing = {"rollout_ms": 0.0, "weight_ms": 0.0, "update_ms": 0.0}
 
-        # 1. Sample perturbations ε ~ N(0, σ²I) on GPU
+        # 1. Sample perturbations ε ~ N(0, diag(sigma_vec)²) on GPU
+        # Sample unit normals then scale per-joint: broadcasts (K,H,7) * (7,)
         # cp.random.normal has no 'out' parameter; assign into the pre-allocated
         # view so we still avoid allocating a fresh (K_max, H, action_dim) buffer.
         self._eps[:] = cp.random.normal(
-            0.0, self.config.sigma,
+            0.0, 1.0,
             (K, H, action_dim),
             dtype=cp.float32,
-        )
+        ) * self.sigma_vec  # per-joint scaling, broadcasts over K and H
 
         # 2. Rollout kernel — K threads, each rolls out H steps
         grid_k, block = self.gpu.get_grid_block(K)

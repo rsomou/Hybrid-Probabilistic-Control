@@ -408,8 +408,8 @@ if __name__ == "__main__":
                         help="MPPI planning horizon")
     parser.add_argument("--deadline", type=float, default=50.0,
                         help="Per-step deadline in ms")
-    parser.add_argument("--sigma",    type=float, default=0.5,
-                        help="MPPI perturbation std")
+    parser.add_argument("--sigma",    type=float, default=1.0,
+                        help="MPPI perturbation global scale (multiplied by per-joint weights)")
     parser.add_argument("--lambda_",  type=float, default=1.0,
                         help="MPPI temperature")
     parser.add_argument("--steps",    type=int,   default=300,
