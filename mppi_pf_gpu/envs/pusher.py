@@ -85,6 +85,18 @@ OBS_DIM    = 16             # q(7) + qdot(7) + obj_pos(2)
 # Pusher-v5 action bounds (verified at runtime against env.action_space)
 ACTION_BOUND = 2.0
 
+# Joint position limits from Pusher-v5 MJCF (limited="true" joints only).
+# Unlimited joints (upper_arm_roll, forearm_roll, wrist_roll) use a very
+# large bound so they are never clamped.  These MUST match MuJoCo so that
+# the MPPI simulation does not plan motions that MuJoCo physically blocks.
+_INF = 1e9
+JOINT_Q_MIN = np.array([-2.2854, -0.5236, -_INF, -2.2000, -_INF, -1.5708, -_INF], dtype=np.float64)
+JOINT_Q_MAX = np.array([ 1.7146,  1.3963,  _INF,  0.0000,  _INF,  1.5708,  _INF], dtype=np.float64)
+# Note: q[3] = elbow_flex has range [-2.2, 0].  At q[3]=0 (start), a positive
+# torque hits the upper limit and produces zero real motion in MuJoCo.  Without
+# this clamping in simulation, MPPI plans large positive q[3] trajectories that
+# look beneficial (arm descends in FK) but are completely unrealizable.
+
 # --------------------------------------------------------------------------- #
 # RNEA rigid-body parameters (computed from Pusher-v5 MJCF geom specs)
 # --------------------------------------------------------------------------- #
@@ -438,6 +450,14 @@ class PusherDynamics(AnalyticalDynamics):
             qdot = qdot + qddot * dt_sub
             q    = q    + qdot  * dt_sub
 
+            # ---- Joint limit clamping (mirrors MuJoCo) --------------------
+            # q[3] (elbow_flex) has range [-2.2, 0]; without this the sim
+            # freely uses q[3]>0 but MuJoCo blocks it → elbow never moves.
+            q_clamped = np.clip(q, JOINT_Q_MIN, JOINT_Q_MAX)
+            # Zero qdot for any joint that hit a limit (absorb velocity)
+            qdot = np.where(q_clamped != q, 0.0, qdot)
+            q = q_clamped
+
             # ---- Object dynamics ------------------------------------------
             obj_vel *= (1.0 - FRICTION * dt_sub)
             obj_pos += obj_vel * dt_sub
@@ -703,7 +723,9 @@ def _generate_cuda_code():
         f"__device__ const float LINK_MASSES_D[7]       = {{{_fmt1d(LINK_MASSES)}}};\n"
         f"__device__ const float LINK_COMS_D[7][3]      = {{{_fmt2d(LINK_COMS)}}};\n"
         f"__device__ const float LINK_INERTIAS_D[7][9]  = {{{_fmt2d(inertia_flat)}}};\n"
-        f"__device__ const float JOINT_DAMPING_D[7]     = {{{_fmt1d(JOINT_DAMPING)}}};\n\n"
+        f"__device__ const float JOINT_DAMPING_D[7]     = {{{_fmt1d(JOINT_DAMPING)}}};\n"
+        f"__device__ const float JOINT_Q_MIN_D[7]       = {{{_fmt1d(JOINT_Q_MIN)}}};\n"
+        f"__device__ const float JOINT_Q_MAX_D[7]       = {{{_fmt1d(JOINT_Q_MAX)}}};\n\n"
     )
 
     body = r"""
@@ -1006,6 +1028,14 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         for (int j=0;j<NUM_JOINTS;j++) {
             qdot[j] += qdd[j]*INNER_DT;
             q[j]    += qdot[j]*INNER_DT;
+            /* Joint limit clamping — mirrors MuJoCo's limit enforcement.
+             * q[3] (elbow_flex) has range [-2.2, 0]: without this the sim
+             * uses positive q[3] values that MuJoCo physically blocks,
+             * making the elbow produce zero real motion in MuJoCo. */
+            float q_lo = JOINT_Q_MIN_D[j];
+            float q_hi = JOINT_Q_MAX_D[j];
+            float q_clamp = fmaxf(fminf(q[j], q_hi), q_lo);
+            if (q_clamp != q[j]) { q[j] = q_clamp; qdot[j] = 0.0f; }
         }
 
         float fric = 1.0f - FRICTION*INNER_DT;
