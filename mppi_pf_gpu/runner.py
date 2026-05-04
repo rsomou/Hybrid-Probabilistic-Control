@@ -328,12 +328,16 @@ def run(config: Config, render: bool = False, record: bool = False,
 
             if not no_pf:
                 # Check how many particles have obj_pos within contact radius
-                # of the INJECTED tip position (state[18:20])
+                # of the INJECTED tip position — using 3D distance just like
+                # the dynamics contact check (tip must be at table height).
                 particles_cpu = cp.asnumpy(pf.particles)
-                p_obj = particles_cpu[:, 14:16]              # (N, 2)
-                p_tip = particles_cpu[:, 18:20]              # (N, 2) injected real tip
-                p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
-                n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
+                p_obj = particles_cpu[:, 14:16]              # (N, 2) obj xy
+                p_tip = particles_cpu[:, 18:20]              # (N, 2) injected real tip xy
+                p_tip_z = particles_cpu[:, 20]               # (N,) tip z
+                dxy = p_obj - p_tip
+                dz  = p_tip_z - TABLE_Z                      # (N,) z gap to table
+                p_dists_3d = np.sqrt(dxy[:, 0]**2 + dxy[:, 1]**2 + dz**2)
+                n_contact = int(np.sum(p_dists_3d < CONTACT_RADIUS))
 
             print(
                 f"  DIAG step {t}: "

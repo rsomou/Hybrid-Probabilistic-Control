@@ -34,9 +34,9 @@ Notes
 * The simplified diagonal-mass-matrix arm dynamics are intentionally
   approximate. MuJoCo's coupled mass matrix governs the real simulation;
   this model exists solely for MPPI/PF planning.
-* Contact detection uses the INJECTED true fingertip position (state[18:20])
-  rather than the analytical FK.  This is critical because the analytical
-  FK (a 2-link planar approximation of a 3D arm) has 0.1–0.7m error.
+* Contact detection uses the INJECTED true fingertip position (state[18:21])
+  rather than the analytical FK.  Between steps the real tip position is
+  injected; during MPPI rollouts the analytical FK tracks the tip.
 """
 
 import numpy as np
@@ -342,10 +342,10 @@ class PusherDynamics(AnalyticalDynamics):
         """
         Compute fingertip (x, y, z) using full 7-DOF forward kinematics.
 
-        Chains all 7 joint transforms then applies the final 0.1m offset
-        from joint-6 origin to the fingertip (avg of tip_arml/tip_armr
-        sphere positions at (0.1,±0.1,0) → midpoint (0.1,0,0) in joint-6
-        local frame).
+        Chains all 7 joint transforms.  The result matches MuJoCo's
+        get_body_com("tips_arm"), which reports the tips_arm body origin
+        — NOT the tip sphere geom centers.  At q=0 this gives
+        (0.821, -0.6, 0), matching the real observation.
 
         Returns
         -------
@@ -357,8 +357,6 @@ class PusherDynamics(AnalyticalDynamics):
         for i in range(NUM_JOINTS):
             pos = pos + R_cum @ JOINT_OFFSETS[i]
             R_cum = R_cum @ _rotation_matrix(JOINT_AXES[i], q[i])
-        # Fingertip is 0.1m along the joint-6 x-axis from the wrist origin
-        pos = pos + R_cum @ np.array([0.1, 0.0, 0.0])
         return float(pos[0]), float(pos[1]), float(pos[2])
 
     @staticmethod
@@ -383,8 +381,8 @@ class PusherDynamics(AnalyticalDynamics):
             positions[i] = pos
             axes_w[i] = R_cum @ JOINT_AXES[i]
             R_cum = R_cum @ _rotation_matrix(JOINT_AXES[i], q[i])
-        # Fingertip is 0.1m along the joint-6 x-axis from the wrist origin
-        tip = pos + R_cum @ np.array([0.1, 0.0, 0.0])
+        # tip = last joint origin (matches MuJoCo get_body_com("tips_arm"))
+        tip = pos.copy()
 
         J_x = np.zeros(NUM_JOINTS, dtype=np.float64)
         J_y = np.zeros(NUM_JOINTS, dtype=np.float64)
@@ -916,12 +914,8 @@ __device__ void forward_kinematics(const float* q, float* tip_x, float* tip_y, f
                 tmp[r*3+c] = R[r*3+0]*Rj[0*3+c] + R[r*3+1]*Rj[1*3+c] + R[r*3+2]*Rj[2*3+c];
         for (int k = 0; k < 9; k++) R[k] = tmp[k];
     }
-    /* Fingertip is 0.1m along the joint-6 x-axis from the wrist origin.
-       tip_arm spheres are at (0.1,±0.1,0) in joint-6 frame; midpoint = (0.1,0,0). */
-    float fx = 0.1f;
-    pos[0] += R[0]*fx;
-    pos[1] += R[3]*fx;
-    pos[2] += R[6]*fx;
+    /* tip = last joint origin.  Matches MuJoCo get_body_com("tips_arm")
+       which reports the tips_arm body origin, not the tip-sphere geom centers. */
     *tip_x = pos[0];
     *tip_y = pos[1];
     *tip_z = pos[2];
@@ -966,9 +960,8 @@ __device__ void planar_jacobian(const float* q, const float* qdot,
                 tmp[r*3+c] = R[r*3+0]*Rj[0*3+c] + R[r*3+1]*Rj[1*3+c] + R[r*3+2]*Rj[2*3+c];
         for (int k = 0; k < 9; k++) R[k] = tmp[k];
     }
-    /* tip = last joint origin + R_cum @ [0.1, 0, 0] (fingertip offset) */
-    float fx = 0.1f;
-    float tip[3] = {pos[0] + R[0]*fx, pos[1] + R[3]*fx, pos[2] + R[6]*fx};
+    /* tip = last joint origin (no extra offset — matches MuJoCo tips_arm body) */
+    float tip[3] = {pos[0], pos[1], pos[2]};
 
     /* Jacobian: J_i = z_i x (tip - p_i) */
     float tvx = 0.0f, tvy = 0.0f;
