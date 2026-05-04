@@ -64,6 +64,8 @@ APPROACH_WEIGHT    = 3.0     # weight on horizontal 2-D tip-to-object distance (
 Z_COST_WEIGHT      = 5.0     # weight on (tip_z - TABLE_Z) when arm is above table plane
 ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2
 TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
+CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
+CONTACT_SCALE      = 0.15    # length-scale of funnel (≈ contact radius); gradient ∝ BONUS/SCALE
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -487,6 +489,7 @@ class PusherDynamics(AnalyticalDynamics):
         action_cost = float(np.dot(action, action))
 
         return (APPROACH_WEIGHT    * d_horiz
+                - CONTACT_BONUS    * np.exp(-d_horiz / CONTACT_SCALE)
                 + Z_COST_WEIGHT    * dz
                 + target_weight    * obj_tgt_dist
                 + ACTION_COST_WEIGHT * action_cost)
@@ -668,7 +671,9 @@ def _generate_cuda_code():
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
         f"#define Z_COST_WEIGHT {Z_COST_WEIGHT:.6f}f\n"
         f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
-        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
+        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
+        f"#define CONTACT_BONUS {CONTACT_BONUS:.6f}f\n"
+        f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1036,6 +1041,7 @@ __device__ float cost_pusher(const float* state, const float* action,
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
     return APPROACH_WEIGHT * d_horiz
+         - CONTACT_BONUS   * expf(-d_horiz / CONTACT_SCALE)
          + Z_COST_WEIGHT   * dz
          + target_weight   * d_target
          + ACTION_COST_WEIGHT * act2;
