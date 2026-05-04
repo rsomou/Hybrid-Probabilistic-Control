@@ -66,6 +66,7 @@ ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2
 TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
 CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
 CONTACT_SCALE      = 0.15    # length-scale of funnel (≈ contact radius); gradient ∝ BONUS/SCALE
+REACH_WEIGHT       = 4.0     # penalty for arm horizontal reach > base-to-object distance (elbow-fold signal)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -485,12 +486,18 @@ class PusherDynamics(AnalyticalDynamics):
         obj_tgt_dist   = float(np.linalg.norm(obj_pos - self._target_pos))
         target_weight  = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
 
-        # 4. Action regularisation
+        # 4. Overextension: penalise arm reach > base-to-object horizontal distance
+        arm_reach_xy = np.sqrt((fk_x - ARM_BASE[0])**2 + (fk_y - ARM_BASE[1])**2)
+        obj_base_dist = np.sqrt((obj_pos[0] - ARM_BASE[0])**2 + (obj_pos[1] - ARM_BASE[1])**2)
+        overextension = max(arm_reach_xy - obj_base_dist, 0.0)
+
+        # 5. Action regularisation
         action_cost = float(np.dot(action, action))
 
         return (APPROACH_WEIGHT    * d_horiz
                 - CONTACT_BONUS    * np.exp(-d_horiz / CONTACT_SCALE)
                 + Z_COST_WEIGHT    * dz
+                + REACH_WEIGHT     * overextension
                 + target_weight    * obj_tgt_dist
                 + ACTION_COST_WEIGHT * action_cost)
 
@@ -673,7 +680,8 @@ def _generate_cuda_code():
         f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
         f"#define CONTACT_BONUS {CONTACT_BONUS:.6f}f\n"
-        f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n\n"
+        f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n"
+        f"#define REACH_WEIGHT {REACH_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1036,13 +1044,23 @@ __device__ float cost_pusher(const float* state, const float* action,
         target_weight += TERMINAL_WEIGHT;
     }
 
-    /* ---- 4. Action regularisation ---- */
+    /* ---- 4. Overextension: penalise arm reach > base-to-object horizontal dist ---- */
+    float arm_adx = fk_x - ARM_BASE_X;
+    float arm_ady = fk_y - ARM_BASE_Y;
+    float arm_reach_xy = sqrtf(arm_adx*arm_adx + arm_ady*arm_ady);
+    float obj_adx = obj_pos[0] - ARM_BASE_X;
+    float obj_ady = obj_pos[1] - ARM_BASE_Y;
+    float obj_base_dist = sqrtf(obj_adx*obj_adx + obj_ady*obj_ady);
+    float overextension = fmaxf(arm_reach_xy - obj_base_dist, 0.0f);
+
+    /* ---- 5. Action regularisation ---- */
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
     return APPROACH_WEIGHT * d_horiz
          - CONTACT_BONUS   * expf(-d_horiz / CONTACT_SCALE)
          + Z_COST_WEIGHT   * dz
+         + REACH_WEIGHT    * overextension
          + target_weight   * d_target
          + ACTION_COST_WEIGHT * act2;
 }
