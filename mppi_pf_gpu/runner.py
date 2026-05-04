@@ -358,9 +358,13 @@ def run(config: Config, render: bool = False, record: bool = False,
                     f"         weights: max={w_max:.6f} min={w_min:.6f} "
                     f"ratio={w_ratio:.1f} std={w_cpu.std():.6f}"
                 )
-            print(
-                f"         action={np.array2string(action, precision=2, separator=',')}"
-            )
+            JOINT_NAMES = ['pan', 'lift', 'roll', 'ELBOW', 'froll', 'wflex', 'wroll']
+            q_labeled = '  '.join(f'{n}={q_now[i]:+.3f}' for i, n in enumerate(JOINT_NAMES))
+            a_labeled = '  '.join(f'{n}={action[i]:+.3f}' for i, n in enumerate(JOINT_NAMES))
+            print(f"         q:      {q_labeled}")
+            print(f"         action: {a_labeled}")
+            print(f"         tip_z={real_tip[2]:+.4f}  TABLE_Z={-0.275:.4f}  "
+                  f"below_table={max(-0.275 - real_tip[2], 0):.4f}m")
 
         if terminated or truncated:
             break

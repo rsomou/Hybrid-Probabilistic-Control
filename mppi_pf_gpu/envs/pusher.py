@@ -62,6 +62,7 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
 APPROACH_WEIGHT    = 3.0     # weight on horizontal 2-D tip-to-object distance (XY only)
 Z_COST_WEIGHT      = 5.0     # weight on (tip_z - TABLE_Z) when arm is above table plane
+FLOOR_WEIGHT       = 30.0    # penalty for arm going BELOW table plane (mirrors MuJoCo table constraint)
 ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2 — kept small so multi-joint actions are not suppressed
 TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
 CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
@@ -482,6 +483,14 @@ class PusherDynamics(AnalyticalDynamics):
         # 2. Z-lowering: penalise arm above table plane
         dz = max(fk_z - TABLE_Z, 0.0)
 
+        # 2b. Floor constraint: penalise arm going BELOW table plane.
+        # MuJoCo's table geometry physically blocks the arm from going below
+        # TABLE_Z, but our RNEA simulation has no floor. Without this term
+        # MPPI plans elbow-flex trajectories that punch through the table;
+        # those trajectories look cheap in simulation but are unrealizable
+        # in MuJoCo, causing the controller to stall.
+        floor_violation = max(TABLE_Z - fk_z, 0.0)
+
         # 3. Object-to-target distance (with terminal boost)
         obj_tgt_dist   = float(np.linalg.norm(obj_pos - self._target_pos))
         target_weight  = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
@@ -497,6 +506,7 @@ class PusherDynamics(AnalyticalDynamics):
         return (APPROACH_WEIGHT    * d_horiz
                 - CONTACT_BONUS    * np.exp(-d_horiz / CONTACT_SCALE)
                 + Z_COST_WEIGHT    * dz
+                + FLOOR_WEIGHT     * floor_violation
                 + REACH_WEIGHT     * overextension
                 + target_weight    * obj_tgt_dist
                 + ACTION_COST_WEIGHT * action_cost)
@@ -681,7 +691,8 @@ def _generate_cuda_code():
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
         f"#define CONTACT_BONUS {CONTACT_BONUS:.6f}f\n"
         f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n"
-        f"#define REACH_WEIGHT {REACH_WEIGHT:.6f}f\n\n"
+        f"#define REACH_WEIGHT {REACH_WEIGHT:.6f}f\n"
+        f"#define FLOOR_WEIGHT {FLOOR_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1035,6 +1046,12 @@ __device__ float cost_pusher(const float* state, const float* action,
     /* ---- 2. Z-lowering: only penalise arm above table plane ---- */
     float dz = fmaxf(fk_z - TABLE_Z, 0.0f);
 
+    /* ---- 2b. Floor constraint: mirror MuJoCo table blocking arm below TABLE_Z.
+     * Without this, MPPI plans elbow-flex trajectories that pass through the
+     * table surface. Those look low-cost in simulation but MuJoCo blocks them,
+     * so joint 3 (elbow_flex) produces no net motion in reality. ---- */
+    float floor_violation = fmaxf(TABLE_Z - fk_z, 0.0f);
+
     /* ---- 3. Object-to-target distance (with terminal boost) ---- */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
@@ -1060,6 +1077,7 @@ __device__ float cost_pusher(const float* state, const float* action,
     return APPROACH_WEIGHT * d_horiz
          - CONTACT_BONUS   * expf(-d_horiz / CONTACT_SCALE)
          + Z_COST_WEIGHT   * dz
+         + FLOOR_WEIGHT    * floor_violation
          + REACH_WEIGHT    * overextension
          + target_weight   * d_target
          + ACTION_COST_WEIGHT * act2;
