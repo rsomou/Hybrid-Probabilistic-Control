@@ -151,8 +151,8 @@ void pf_propagate(
     //   joint dims  (d < 14):  process_noise_std  (0 — injected each step)
     //   obj_pos     (d 14-15): process_noise_std_obj  (exploration noise)
     //   obj_vel     (d 16-17): 0  (derived from contact dynamics)
-    //   tip_xy      (d 18-19): 0  (derived deterministically from FK)
-    //   tip_z       (d 20):    0  (derived deterministically from FK)
+    //   fork_xy     (d 18-19): 0  (derived deterministically from FK)
+    //   fork_z      (d 20):    0  (derived deterministically from FK)
     for (int d = 0; d < STATE_DIM; d++) {
         float ns;
         if (d < 2 * NUM_JOINTS) {
@@ -160,7 +160,7 @@ void pf_propagate(
         } else if (d < 2 * NUM_JOINTS + 2) {
             ns = process_noise_std_obj;   // obj_pos only
         } else {
-            ns = 0.0f;                    // obj_vel, tip_xy, tip_z: deterministic
+            ns = 0.0f;                    // obj_vel, fork_xy, fork_z: deterministic
         }
         particles[i * STATE_DIM + d] = state[d] + ns * noise[i * STATE_DIM + d];
     }
@@ -187,8 +187,8 @@ void pf_propagate(
 #   [7:14]  qdot     state[7:14]  ← skip (injected)
 #   [14:16] obj_pos  state[14:16] ← compared to obs[14:16]
 #   [16:18] obj_vel  state[16:18] ← not observed
-#   [18:20] tip_xy   state[18:20] ← not observed
-#   [20]    tip_z    state[20]    ← not observed
+#   [18:20] fork_xy  state[18:20] ← not observed
+#   [20]    fork_z   state[20]    ← not observed
 #
 # Two noise scales:
 #   obs_noise_std      — tight, for joint dims d < 14

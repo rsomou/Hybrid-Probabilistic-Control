@@ -59,21 +59,22 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
     return obs[20:22].astype(np.float32)
 
 
-def _obs_to_state(obs: np.ndarray) -> np.ndarray:
+def _obs_to_state(obs: np.ndarray, dynamics) -> np.ndarray:
     """
     Build a full 21-dim state vector directly from a Pusher-v5 observation.
     Used in --no-pf mode to give MPPI perfect state information.
 
-    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_xy(2), tip_z(1)]
-    Obs layout:   [q(7), qdot(7), tip_xyz(3), obj_xyz(3), goal_xyz(3)]
+    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), fork_xy(2), fork_z(1)]
     """
+    fk_x, fk_y, fk_z = dynamics._forward_kinematics(obs[0:7])
     state = np.zeros(21, dtype=np.float32)
     state[0:7]   = obs[0:7]    # joint angles
     state[7:14]  = obs[7:14]   # joint velocities
-    state[14:16] = obs[17:19]  # object xy (obs[17:20] is obj_xyz; take x,y)
+    state[14:16] = obs[17:19]  # object xy
     state[16:18] = 0.0         # object velocity — not in obs, assume zero
-    state[18:20] = obs[14:16]  # fingertip xy (obs[14:17] is tip_xyz; take x,y)
-    state[20]    = obs[16]     # fingertip z
+    state[18]    = fk_x        # fork xy from analytical FK
+    state[19]    = fk_y
+    state[20]    = fk_z        # fork z from analytical FK
     return state
 
 
@@ -145,18 +146,13 @@ def run(config: Config, render: bool = False, record: bool = False,
     # ---- Initial diagnostics -----------------------------------------------
     print(f"\n{'='*60}")
     print(f"  INIT DIAG")
-    q0       = obs[0:7]
-    tip0     = obs[14:17]
-    obj0     = obs[17:20]
-    goal0    = obs[20:23]
-    anal0    = dynamics._forward_kinematics(q0)
-    print(f"  q0         = {np.array2string(q0, precision=3, separator=',')}")
-    print(f"  real_tip0  = ({tip0[0]:+.3f}, {tip0[1]:+.3f}, {tip0[2]:+.3f})")
-    print(f"  anal_tip0  = ({anal0[0]:+.3f}, {anal0[1]:+.3f}, {anal0[2]:+.3f})")
-    print(f"  tip_z gap  = {tip0[2] - TABLE_Z:+.4f}  (tip_z={tip0[2]:+.4f}, table_z={TABLE_Z:.4f})")
-    print(f"  real_obj0  = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
-    print(f"  goal       = ({goal0[0]:+.3f}, {goal0[1]:+.3f}, {goal0[2]:+.3f})")
-    print(f"  target(2d) = ({target[0]:+.3f}, {target[1]:+.3f})")
+    q0    = obs[0:7]
+    obj0  = obs[17:20]
+    fork0 = dynamics._forward_kinematics(q0)
+    print(f"  fork0  = ({fork0[0]:+.3f}, {fork0[1]:+.3f}, {fork0[2]:+.3f})  (FK = wrist fork)")
+    print(f"  obj0   = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
+    print(f"  goal   = ({target[0]:+.3f}, {target[1]:+.3f})")
+    print(f"  fork_z = {fork0[2]:+.4f}  TABLE_Z = {TABLE_Z:.4f}")
     print(f"{'='*60}\n")
 
     # ---- Control loop ------------------------------------------------------
@@ -168,7 +164,7 @@ def run(config: Config, render: bool = False, record: bool = False,
         if no_pf:
             # ---- Perfect-information mode: bypass PF entirely --------------
             # Build state directly from the current observation.
-            state_vec   = _obs_to_state(obs)
+            state_vec   = _obs_to_state(obs, dynamics)
             state_gpu   = cp.asarray(state_vec, dtype=cp.float32).reshape(1, -1)
             initial_states = cp.repeat(state_gpu, mppi.K, axis=0)
             ess = float(config.N)   # sentinel — PF not running
@@ -239,15 +235,14 @@ def run(config: Config, render: bool = False, record: bool = False,
                     ),
                 )
 
-            # Inject the most recent REAL tip position (xyz) into the mean state.
-            # The analytical FK has residual error; using the real MuJoCo tip
-            # position ensures MPPI starts planning from the correct 3D position.
-            # obs_buffer[-1] has the latest observation (step t-1).
+            # Compute fork position from FK using the latest observed q.
+            # This is the wrist fork (collision geometry), NOT obs[14:17]
+            # (fingertip marker which is ~8cm offset from the fork).
             latest_obs = obs_buffer[-1] if len(obs_buffer) > 0 else obs
-            real_tip_xy = cp.asarray(latest_obs[14:16].astype(np.float32))
-            mean_gpu[0, 18] = real_tip_xy[0]
-            mean_gpu[0, 19] = real_tip_xy[1]
-            mean_gpu[0, 20] = cp.float32(float(latest_obs[16]))   # tip_z
+            fk_x, fk_y, fk_z = dynamics._forward_kinematics(latest_obs[0:7])
+            mean_gpu[0, 18] = cp.float32(fk_x)
+            mean_gpu[0, 19] = cp.float32(fk_y)
+            mean_gpu[0, 20] = cp.float32(fk_z)
 
             # Tile the single state across all K MPPI rollout starts
             initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
@@ -315,64 +310,40 @@ def run(config: Config, render: bool = False, record: bool = False,
 
         # ---- Diagnostic output every 10 steps ----------------------------
         if t % 10 == 0:
-            q_now        = obs[0:7]
-            real_tip     = obs[14:17]                        # MuJoCo fingertip xyz
-            real_obj     = obs[17:20]                        # MuJoCo object xyz
-            anal_tip     = dynamics._forward_kinematics(q_now)  # our FK (x, y, z)
-            tip_err      = np.sqrt((anal_tip[0] - real_tip[0])**2
-                                   + (anal_tip[1] - real_tip[1])**2)
-            # 2D XY distance and full 3D distance (obj z ≈ TABLE_Z = -0.275)
-            tip_obj_dist    = np.sqrt((real_tip[0] - real_obj[0])**2
-                                     + (real_tip[1] - real_obj[1])**2)
-            tip_obj_dist_3d = float(np.linalg.norm(real_tip - real_obj))
+            q_now    = obs[0:7]
+            real_obj = obs[17:20]
+            # FK = fork position (r_wrist_roll_link body = collision geometry)
+            fork     = dynamics._forward_kinematics(q_now)
+            fork_xyz = np.array(fork)
+            fork_obj_3d = float(np.linalg.norm(
+                fork_xyz - np.array([real_obj[0], real_obj[1], TABLE_Z])))
 
             if not no_pf:
-                # Check how many particles have obj_pos within contact radius
-                # of the INJECTED tip position — using 3D distance just like
-                # the dynamics contact check (tip must be at table height).
                 particles_cpu = cp.asnumpy(pf.particles)
-                p_obj = particles_cpu[:, 14:16]              # (N, 2) obj xy
-                p_tip = particles_cpu[:, 18:20]              # (N, 2) injected real tip xy
-                p_tip_z = particles_cpu[:, 20]               # (N,) tip z
-                dxy = p_obj - p_tip
-                dz  = p_tip_z - TABLE_Z                      # (N,) z gap to table
-                p_dists_3d = np.sqrt(dxy[:, 0]**2 + dxy[:, 1]**2 + dz**2)
-                n_contact = int(np.sum(p_dists_3d < CONTACT_RADIUS))
+                p_obj   = particles_cpu[:, 14:16]
+                p_fork  = particles_cpu[:, 18:20]
+                p_fz    = particles_cpu[:, 20]
+                dxy = p_obj - p_fork
+                dz  = p_fz - TABLE_Z
+                p_d3d = np.sqrt(dxy[:, 0]**2 + dxy[:, 1]**2 + dz**2)
+                n_contact = int(np.sum(p_d3d < CONTACT_RADIUS))
 
             print(
                 f"  DIAG step {t}: "
-                f"real_tip=({real_tip[0]:+.3f},{real_tip[1]:+.3f},{real_tip[2]:+.3f}) "
-                f"anal_tip=({anal_tip[0]:+.3f},{anal_tip[1]:+.3f}) "
-                f"FK_err={tip_err:.4f}m"
-            )
-            print(
-                f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f},{real_obj[2]:+.3f}) "
-                f"tip→obj_xy={tip_obj_dist:.3f}m  tip→obj_3d={tip_obj_dist_3d:.3f}m "
-                f"contact_r={CONTACT_RADIUS}"
+                f"fork=({fork[0]:+.3f},{fork[1]:+.3f},{fork[2]:+.3f}) "
+                f"obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
+                f"fork→obj_3d={fork_obj_3d:.3f}m"
             )
             if not no_pf:
-                obj_mean = p_obj.mean(axis=0)
-                obj_std  = p_obj.std(axis=0)
                 w_cpu = cp.asnumpy(pf.weights)
                 w_max = w_cpu.max()
                 w_min = w_cpu[w_cpu > 0].min() if (w_cpu > 0).any() else 0.0
-                w_ratio = w_max / w_min if w_min > 0 else float('inf')
                 print(
-                    f"         particles: obj_mean=({obj_mean[0]:+.3f},{obj_mean[1]:+.3f}) "
-                    f"obj_std=({obj_std[0]:.3f},{obj_std[1]:.3f}) "
-                    f"n_in_contact={n_contact}/{config.N}"
+                    f"         PF: obj_mean=({p_obj.mean(0)[0]:+.3f},{p_obj.mean(0)[1]:+.3f}) "
+                    f"n_contact={n_contact}/{config.N} "
+                    f"w_ratio={w_max/w_min if w_min>0 else float('inf'):.0f}"
                 )
-                print(
-                    f"         weights: max={w_max:.6f} min={w_min:.6f} "
-                    f"ratio={w_ratio:.1f} std={w_cpu.std():.6f}"
-                )
-            JOINT_NAMES = ['pan', 'lift', 'roll', 'ELBOW', 'froll', 'wflex', 'wroll']
-            q_labeled = '  '.join(f'{n}={q_now[i]:+.3f}' for i, n in enumerate(JOINT_NAMES))
-            a_labeled = '  '.join(f'{n}={action[i]:+.3f}' for i, n in enumerate(JOINT_NAMES))
-            print(f"         q:      {q_labeled}")
-            print(f"         action: {a_labeled}")
-            print(f"         tip_z={real_tip[2]:+.4f}  TABLE_Z={-0.275:.4f}  "
-                  f"below_table={max(-0.275 - real_tip[2], 0):.4f}m")
+            print(f"         fork_z={fork[2]:+.4f}  TABLE_Z={TABLE_Z:.4f}")
 
         if terminated or truncated:
             break

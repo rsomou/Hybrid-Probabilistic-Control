@@ -3,16 +3,18 @@ envs/pusher.py
 Analytical dynamics for the Gymnasium Pusher-v5 environment.
 
 State layout (STATE_DIM = 21):
-    [0:7]   q        — joint angles (rad)
-    [7:14]  qdot     — joint velocities (rad/s)
-    [14:16] obj_pos  — 2-D object position (x, y)       — HIDDEN from PF
-    [16:18] obj_vel  — 2-D object velocity (vx, vy)     — HIDDEN from PF
-    [18:20] tip_xy   — 2-D fingertip position (x, y)    — INJECTED from obs
-    [20]    tip_z    — fingertip z-height                — INJECTED from obs
+    [0:7]   q         — joint angles (rad)
+    [7:14]  qdot      — joint velocities (rad/s)
+    [14:16] obj_pos   — 2-D object position (x, y)       — HIDDEN from PF
+    [16:18] obj_vel   — 2-D object velocity (vx, vy)     — HIDDEN from PF
+    [18:20] fork_xy   — wrist fork position (x, y)       — from FK
+    [20]    fork_z    — wrist fork z-height               — from FK
 
-    tip_xy and tip_z are the TRUE fingertip positions from MuJoCo, injected
-    each step via inject_observation().  During MPPI multi-step rollouts,
-    they are updated by the analytical FK after each step.
+    fork_xy/fork_z track the r_wrist_roll_link body origin, which is where
+    the collision-enabled fork geoms (geoms 13-15) are centered.  This is
+    NOT the same as obs[14:17] (fingertip marker), which is ~8cm offset.
+    Between steps, fork position is computed via our analytical FK.
+    During MPPI rollouts, FK updates it after each substep.
 
 True Pusher-v5 Gymnasium observation (23-dim, float64):
     [0:7]   q              — raw joint angles (rad)
@@ -34,9 +36,9 @@ Notes
 * The simplified diagonal-mass-matrix arm dynamics are intentionally
   approximate. MuJoCo's coupled mass matrix governs the real simulation;
   this model exists solely for MPPI/PF planning.
-* Contact detection uses the INJECTED true fingertip position (state[18:21])
-  rather than the analytical FK.  Between steps the real tip position is
-  injected; during MPPI rollouts the analytical FK tracks the tip.
+* Contact detection uses state[18:21] (the wrist fork position).
+  Between steps this is set via our analytical FK from the current q.
+  During MPPI rollouts FK updates it each substep.
 """
 
 import numpy as np
@@ -58,23 +60,22 @@ FRICTION       = 0.5        # object slide-joint damping coefficient (matches Mu
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
-# --- Z-height and approach cost parameters ---
+# --- Cost function weights ---
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
-APPROACH_WEIGHT    = 8.0     # weight on horizontal 2-D tip-to-object distance (XY only)
-Z_COST_WEIGHT      = 5.0     # weight on (tip_z - TABLE_Z) when arm is above table plane
-FLOOR_WEIGHT       = 30.0    # penalty for arm going BELOW table plane (mirrors MuJoCo table constraint)
-ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2 — kept small so multi-joint actions are not suppressed
-TERMINAL_WEIGHT    = 5.0     # extra multiplier on obj-target cost at final horizon step
-CONTACT_BONUS      = 5.0     # amplitude of exponential contact-funnel reward
-CONTACT_SCALE      = 0.25    # length-scale of funnel; wider = stronger gradient at 0.28m stall distance
-REACH_WEIGHT       = 0.5     # reduced: joint limits now prevent elbow abuse; high weight was fighting approach
+APPROACH_WEIGHT    = 10.0    # weight on 3-D fork-to-object distance
+Z_COST_WEIGHT      = 8.0     # extra penalty on fork being above table plane
+FLOOR_WEIGHT       = 20.0    # penalty for fork below table (unrealizable in MuJoCo)
+ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2
+TERMINAL_WEIGHT    = 10.0    # extra multiplier on obj-target cost at final horizon step
+CONTACT_BONUS      = 8.0     # amplitude of exponential contact-funnel reward
+CONTACT_SCALE      = 0.20    # length-scale of funnel
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
 # Full 7-DOF FK uses JOINT_AXES, JOINT_OFFSETS, and this base.
 ARM_BASE = np.array([0.0, -0.6, 0.0], dtype=np.float64)
 
-STATE_DIM  = 21             # 7q + 7qdot + 2 obj_pos + 2 obj_vel + 2 tip_xy + 1 tip_z
+STATE_DIM  = 21             # 7q + 7qdot + 2 obj_pos + 2 obj_vel + 2 fork_xy + 1 fork_z
 ACTION_DIM = 7
 # PARTIAL OBSERVABILITY: PF sees only [q(7), qdot(7)] — object position is hidden.
 # gym_obs_to_pf_obs() returns [q(7), qdot(7), obj_xy(2)] = 16 dims.
@@ -407,18 +408,18 @@ class PusherDynamics(AnalyticalDynamics):
         Pusher-v5 uses frame_skip=5 with inner dt=0.01.  The integrator
         performs 5 semi-implicit Euler substeps to match MuJoCo.
 
-        state layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_xy(2), tip_z(1)]
+        state layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), fork_xy(2), fork_z(1)]
         action: (7,) joint torques
         """
         state  = np.asarray(state, dtype=np.float64)
         action = np.clip(action, -ACTION_BOUND, ACTION_BOUND).astype(np.float64)
 
-        q       = state[0:7].copy()
-        qdot    = state[7:14].copy()
-        obj_pos = state[14:16].copy()
-        obj_vel = state[16:18].copy()
-        tip_xy  = state[18:20].copy()
-        tip_z   = float(state[20])
+        q        = state[0:7].copy()
+        qdot     = state[7:14].copy()
+        obj_pos  = state[14:16].copy()
+        obj_vel  = state[16:18].copy()
+        fork_xy  = state[18:20].copy()
+        fork_z   = float(state[20])
 
         dt_sub = INNER_DT
 
@@ -428,8 +429,8 @@ class PusherDynamics(AnalyticalDynamics):
             tip_vx = float(J_x @ qdot)
             tip_vy = float(J_y @ qdot)
 
-            diff_xy = obj_pos - tip_xy
-            dz_contact = tip_z - TABLE_Z   # positive when tip above table
+            diff_xy = obj_pos - fork_xy
+            dz_contact = fork_z - TABLE_Z   # positive when fork above table
             dist = np.sqrt(diff_xy[0]**2 + diff_xy[1]**2 + dz_contact**2)
 
             tau_total = action.copy()
@@ -469,9 +470,9 @@ class PusherDynamics(AnalyticalDynamics):
             obj_vel *= (1.0 - FRICTION * dt_sub)
             obj_pos += obj_vel * dt_sub
 
-            # ---- Update tip via FK ----------------------------------------
-            tip_x, tip_y, tip_z = self._forward_kinematics(q)
-            tip_xy = np.array([tip_x, tip_y])
+            # ---- Update fork position via FK ------------------------------
+            fx, fy, fork_z = self._forward_kinematics(q)
+            fork_xy = np.array([fx, fy])
 
         # ---- Pack next state ------------------------------------------
         next_state = np.empty(STATE_DIM, dtype=np.float64)
@@ -479,9 +480,9 @@ class PusherDynamics(AnalyticalDynamics):
         next_state[7:14]  = qdot
         next_state[14:16] = obj_pos
         next_state[16:18] = obj_vel
-        next_state[18]    = tip_xy[0]
-        next_state[19]    = tip_xy[1]
-        next_state[20]    = tip_z
+        next_state[18]    = fork_xy[0]
+        next_state[19]    = fork_xy[1]
+        next_state[20]    = fork_z
         return next_state
 
     # ------------------------------------------------------------------ #
@@ -501,28 +502,20 @@ class PusherDynamics(AnalyticalDynamics):
 
         obj_pos = state[14:16]
         fk_x, fk_y, fk_z = state[18], state[19], state[20]
-        dz_approach = fk_z - TABLE_Z   # signed; positive when arm above table
+
+        # 1. 3-D fork-to-object distance
+        dz_approach = fk_z - TABLE_Z
         d_3d = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2 + dz_approach**2)
 
-        # 2. Extra above-table penalty (reinforces Z descent on top of 3D approach gradient)
+        # 2. Above-table penalty
         dz = max(dz_approach, 0.0)
 
-        # 2b. Floor constraint: penalise arm going BELOW table plane.
-        # MuJoCo's table geometry physically blocks the arm from going below
-        # TABLE_Z, but our RNEA simulation has no floor. Without this term
-        # MPPI plans elbow-flex trajectories that punch through the table;
-        # those trajectories look cheap in simulation but are unrealizable
-        # in MuJoCo, causing the controller to stall.
+        # 3. Below-table penalty (unrealizable in MuJoCo)
         floor_violation = max(TABLE_Z - fk_z, 0.0)
 
-        # 3. Object-to-target distance (with terminal boost)
-        obj_tgt_dist   = float(np.linalg.norm(obj_pos - self._target_pos))
-        target_weight  = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
-
-        # 4. Overextension: penalise arm reach > base-to-object horizontal distance
-        arm_reach_xy = np.sqrt((fk_x - ARM_BASE[0])**2 + (fk_y - ARM_BASE[1])**2)
-        obj_base_dist = np.sqrt((obj_pos[0] - ARM_BASE[0])**2 + (obj_pos[1] - ARM_BASE[1])**2)
-        overextension = max(arm_reach_xy - obj_base_dist, 0.0)
+        # 4. Object-to-goal distance (with terminal boost)
+        obj_tgt_dist  = float(np.linalg.norm(obj_pos - self._target_pos))
+        target_weight = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
 
         # 5. Action regularisation
         action_cost = float(np.dot(action, action))
@@ -531,7 +524,6 @@ class PusherDynamics(AnalyticalDynamics):
                 - CONTACT_BONUS    * np.exp(-d_3d / CONTACT_SCALE)
                 + Z_COST_WEIGHT    * dz
                 + FLOOR_WEIGHT     * floor_violation
-                + REACH_WEIGHT     * overextension
                 + target_weight    * obj_tgt_dist
                 + ACTION_COST_WEIGHT * action_cost)
 
@@ -595,10 +587,11 @@ class PusherDynamics(AnalyticalDynamics):
         """
         obs = np.asarray(obs, dtype=np.float64)
 
-        q      = obs[0:7]
-        qdot   = obs[7:14]
-        tip_xy = obs[14:16]   # real fingertip x, y
-        tip_z  = float(obs[16])  # real fingertip z
+        q    = obs[0:7]
+        qdot = obs[7:14]
+
+        # Compute fork position via FK (NOT from obs[14:17] fingertip marker)
+        fk_x, fk_y, fk_z = self._forward_kinematics(q)
 
         particles = np.zeros((N, STATE_DIM), dtype=np.float32)
 
@@ -608,11 +601,6 @@ class PusherDynamics(AnalyticalDynamics):
 
         # Object position: sample from Pusher-v5 initial prior in WORLD FRAME.
         # MJCF body origin (0.45, -0.05, -0.275).
-        # Joint ordering in pusher_v5.xml: obj_slidey (qpos[-4]) then
-        # obj_slidex (qpos[-3]).  reset_model assigns:
-        #   cylinder_pos[0] = U(-0.3, 0)   → obj_slidey → y offset
-        #   cylinder_pos[1] = U(-0.2, 0.2) → obj_slidex → x offset
-        # World-frame ranges:
         #   x = 0.45 + U(-0.2, 0.2) → U(0.25, 0.65)
         #   y = -0.05 + U(-0.3, 0)  → U(-0.35, -0.05)
         particles[:, 14] = np.random.uniform(0.25, 0.65, N).astype(np.float32)
@@ -621,10 +609,10 @@ class PusherDynamics(AnalyticalDynamics):
         # Object velocity: zero prior
         particles[:, 16:18] = 0.0
 
-        # Fingertip xy + z: set from real observation
-        particles[:, 18] = tip_xy[0]
-        particles[:, 19] = tip_xy[1]
-        particles[:, 20] = tip_z
+        # Fork position from FK
+        particles[:, 18] = np.float32(fk_x)
+        particles[:, 19] = np.float32(fk_y)
+        particles[:, 20] = np.float32(fk_z)
 
         # Small jitter on joint dims so initial cloud is not degenerate
         particles[:, 0:7]  += np.random.normal(0.0, 0.01, (N, 7)).astype(np.float32)
@@ -697,7 +685,7 @@ def _generate_cuda_code():
     params = (
         "/* =========================================================\n"
         "   Pusher-v5 CUDA device code — RNEA rigid-body dynamics\n"
-        "   State: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_xy(2), tip_z(1)]\n"
+        "   State: [q(7), qdot(7), obj_pos(2), obj_vel(2), fork_xy(2), fork_z(1)]\n"
         "   ========================================================= */\n\n"
         "#define STATE_DIM       21\n"
         "#define ACTION_DIM      7\n"
@@ -705,7 +693,7 @@ def _generate_cuda_code():
         "#define OBS_DIM         16\n"
         "#define CONTACT_RADIUS  0.17f\n"
         "#define PUSH_STRENGTH   20.0f\n"
-        "#define FRICTION        0.2f\n"
+        "#define FRICTION        0.5f\n"
         "#define ACTION_BOUND    2.0f\n"
         "#define N_SUBSTEPS      5\n"
         "#define INNER_DT        0.01f\n"
@@ -717,7 +705,6 @@ def _generate_cuda_code():
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
         f"#define CONTACT_BONUS {CONTACT_BONUS:.6f}f\n"
         f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n"
-        f"#define REACH_WEIGHT {REACH_WEIGHT:.6f}f\n"
         f"#define FLOOR_WEIGHT {FLOOR_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
@@ -989,8 +976,8 @@ __device__ void f_pusher(float* state, const float* action, float dt)
     float* qdot    = state + 7;
     float* obj_pos = state + 14;
     float* obj_vel = state + 16;
-    float* tip_xy  = state + 18;   /* [18]=tip_x, [19]=tip_y */
-    float* tip_z   = state + 20;   /* [20]=tip_z */
+    float* fork_xy = state + 18;   /* [18]=fork_x, [19]=fork_y */
+    float* fork_z  = state + 20;   /* [20]=fork_z */
 
     float tau[NUM_JOINTS];
     for (int j=0;j<NUM_JOINTS;j++)
@@ -1000,8 +987,8 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         /* ---- Contact (3D distance: arm must be at table height) ---- */
         float Jx[NUM_JOINTS], Jy[NUM_JOINTS], tvx, tvy;
         planar_jacobian(q, qdot, Jx, Jy, &tvx, &tvy);
-        float dx = obj_pos[0]-tip_xy[0], dy = obj_pos[1]-tip_xy[1];
-        float dz_contact = *tip_z - TABLE_Z;   /* positive = tip above table */
+        float dx = obj_pos[0]-fork_xy[0], dy = obj_pos[1]-fork_xy[1];
+        float dz_contact = *fork_z - TABLE_Z;   /* positive = fork above table */
         float dist = sqrtf(dx*dx + dy*dy + dz_contact*dz_contact);
 
         float tau_t[NUM_JOINTS];
@@ -1057,69 +1044,48 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         obj_pos[0] += obj_vel[0]*INNER_DT;
         obj_pos[1] += obj_vel[1]*INNER_DT;
 
-        /* Update tip xy + z from FK */
-        forward_kinematics(q, &tip_xy[0], &tip_xy[1], tip_z);
+        /* Update fork xy + z from FK */
+        forward_kinematics(q, &fork_xy[0], &fork_xy[1], fork_z);
     }
 }
 
 /* ================================================================== */
 /*  cost_pusher: split-signal approach cost                            */
 /*                                                                      */
-/*  Two independent approach signals:                                   */
-/*    1. Horizontal 2-D distance: tip XY → object XY (APPROACH_WEIGHT) */
-/*    2. Z-lowering penalty: tip_z above TABLE_Z    (Z_COST_WEIGHT)    */
-/*  Goal signal:                                                        */
-/*    3. Object-to-target 2-D distance (with terminal boost)           */
-/*  Regularisation:                                                     */
-/*    4. Action cost                                                    */
+/*  1. 3-D fork-to-object distance (APPROACH_WEIGHT)                    */
+/*  2. Fork above table penalty   (Z_COST_WEIGHT)                      */
+/*  3. Fork below table penalty   (FLOOR_WEIGHT)                       */
+/*  4. Object-to-goal distance    (1 + TERMINAL_WEIGHT at last step)   */
+/*  5. Action regularisation      (ACTION_COST_WEIGHT)                 */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
 {
     const float* obj_pos = state + 14;
 
-    /* Tip position is kept up-to-date in state[18:21] by f_pusher.
-     * Read directly — avoids a redundant full FK evaluation per cost call. */
+    /* Fork position is kept up-to-date in state[18:21] by f_pusher. */
     float fk_x = state[18];
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* ---- 1. Full 3-D tip-to-object distance.
-     * Object sits at TABLE_Z in Z, so target = (obj_x, obj_y, TABLE_Z).
-     * 3D distance forces MPPI to descend to table level AND close XY gap
-     * simultaneously; a 2D-only cost left Z under-constrained so the arm
-     * hovered above the table and never made real MuJoCo contact. ---- */
+    /* ---- 1. 3-D fork-to-object distance (drives approach + descent) ---- */
     float dx = fk_x - obj_pos[0];
     float dy = fk_y - obj_pos[1];
-    float dz_approach = fk_z - TABLE_Z;   /* signed — positive when arm above table */
+    float dz_approach = fk_z - TABLE_Z;
     float d_3d = sqrtf(dx*dx + dy*dy + dz_approach*dz_approach);
 
-    /* ---- 2. Extra above-table penalty (reinforces Z descent on top of 3D approach) ---- */
+    /* ---- 2. Above-table penalty (extra incentive to descend) ---- */
     float dz = fmaxf(dz_approach, 0.0f);
 
-    /* ---- 2b. Floor constraint: mirror MuJoCo table blocking arm below TABLE_Z.
-     * Without this, MPPI plans elbow-flex trajectories that pass through the
-     * table surface. Those look low-cost in simulation but MuJoCo blocks them,
-     * so joint 3 (elbow_flex) produces no net motion in reality. ---- */
+    /* ---- 3. Below-table penalty (unrealizable in MuJoCo) ---- */
     float floor_violation = fmaxf(TABLE_Z - fk_z, 0.0f);
 
-    /* ---- 3. Object-to-target distance (with terminal boost) ---- */
+    /* ---- 4. Object-to-goal distance (with terminal boost) ---- */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
     float target_weight = 1.0f;
-    if (t == H - 1) {
-        target_weight += TERMINAL_WEIGHT;
-    }
-
-    /* ---- 4. Overextension: penalise arm reach > base-to-object horizontal dist ---- */
-    float arm_adx = fk_x - ARM_BASE_X;
-    float arm_ady = fk_y - ARM_BASE_Y;
-    float arm_reach_xy = sqrtf(arm_adx*arm_adx + arm_ady*arm_ady);
-    float obj_adx = obj_pos[0] - ARM_BASE_X;
-    float obj_ady = obj_pos[1] - ARM_BASE_Y;
-    float obj_base_dist = sqrtf(obj_adx*obj_adx + obj_ady*obj_ady);
-    float overextension = fmaxf(arm_reach_xy - obj_base_dist, 0.0f);
+    if (t == H - 1) target_weight += TERMINAL_WEIGHT;
 
     /* ---- 5. Action regularisation ---- */
     float act2 = 0.0f;
@@ -1129,7 +1095,6 @@ __device__ float cost_pusher(const float* state, const float* action,
          - CONTACT_BONUS   * expf(-d_3d / CONTACT_SCALE)
          + Z_COST_WEIGHT   * dz
          + FLOOR_WEIGHT    * floor_violation
-         + REACH_WEIGHT    * overextension
          + target_weight   * d_target
          + ACTION_COST_WEIGHT * act2;
 }

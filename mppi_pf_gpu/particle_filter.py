@@ -106,11 +106,9 @@ class ParticleFilter:
         ----------
         obs : (23,) numpy array — raw Pusher-v5 gym observation
         """
-        # Extract only q/qdot (first 14 dims of raw obs) for injection.
-        # gym_obs_to_pf_obs() now returns 16 dims (includes obj_pos) which
-        # is used by the weight update, but injection only overwrites q/qdot.
+        # Extract q/qdot (first 14 dims of raw obs) for injection.
         q_qdot  = obs[0:14].astype(np.float32)
-        obs_gpu = cp.asarray(q_qdot, dtype=cp.float32)       # → GPU
+        obs_gpu = cp.asarray(q_qdot, dtype=cp.float32)
 
         # Broadcast observed q/qdot to all N particles, add tiny jitter
         jitter = cp.random.normal(
@@ -119,12 +117,13 @@ class ParticleFilter:
         )
         self.particles[:, 0:14] = obs_gpu[None, :] + jitter
 
-        # Inject the real fingertip position (obs[14:17]) into state[18:21].
-        # obs[14:16] = tip_xy, obs[16] = tip_z. This is critical: contact
-        # detection uses state[18:21] instead of the (approximate) analytical FK.
-        tip_xyz = cp.asarray(obs[14:17].astype(np.float32), dtype=cp.float32)
-        self.particles[:, 18:20] = tip_xyz[None, :2]   # tip_xy
-        self.particles[:, 20]    = tip_xyz[2]           # tip_z
+        # Compute fork position (= r_wrist_roll_link body origin) via our FK.
+        # This is NOT obs[14:17] (fingertip marker), which is ~8cm offset
+        # from the actual collision geometry.
+        fk_x, fk_y, fk_z = self.dynamics._forward_kinematics(obs[0:7])
+        self.particles[:, 18] = np.float32(fk_x)
+        self.particles[:, 19] = np.float32(fk_y)
+        self.particles[:, 20] = np.float32(fk_z)
 
     # ------------------------------------------------------------------ #
     # Propagation (prior update)
