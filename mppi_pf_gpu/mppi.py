@@ -60,6 +60,9 @@ class MPPI:
         # Target position set once per episode via set_target()
         self.target_gpu: cp.ndarray = None
 
+        # Action smoothing: EMA of output actions across steps
+        self._prev_action: np.ndarray = np.zeros(action_dim, dtype=np.float32)
+
         # ---- Compile all MPPI kernels once --------------------------------
         # Use RawModule so the source is compiled exactly once and all three
         # kernel functions are loaded from the same compiled binary.
@@ -101,10 +104,11 @@ class MPPI:
         self.target_gpu = cp.asarray(target, dtype=cp.float32)
 
     def reset(self):
-        """Reset nominal control sequence for a new episode."""
+        """Reset nominal control sequence and smoothing state for a new episode."""
         self.u_bar = cp.zeros(
             (self.H, self.dynamics.action_dim), dtype=cp.float32
         )
+        self._prev_action = np.zeros(self.dynamics.action_dim, dtype=np.float32)
 
     # ------------------------------------------------------------------ #
     # Core planning step
@@ -150,15 +154,20 @@ class MPPI:
 
         timing = {"rollout_ms": 0.0, "weight_ms": 0.0, "update_ms": 0.0}
 
-        # 1. Sample perturbations ε ~ N(0, diag(sigma_vec)²) on GPU
-        # Sample unit normals then scale per-joint: broadcasts (K,H,7) * (7,)
-        # cp.random.normal has no 'out' parameter; assign into the pre-allocated
-        # view so we still avoid allocating a fresh (K_max, H, action_dim) buffer.
-        self._eps[:] = cp.random.normal(
-            0.0, 1.0,
-            (K, H, action_dim),
-            dtype=cp.float32,
-        ) * self.sigma_vec  # per-joint scaling, broadcasts over K and H
+        # 1. Sample temporally-correlated perturbations on GPU.
+        #    eps[t] = beta * eps[t-1] + sqrt(1-beta^2) * white[t]
+        #    This produces smooth action sequences instead of i.i.d. jitter.
+        beta = self.config.noise_beta
+        white = cp.random.normal(
+            0.0, 1.0, (K, H, action_dim), dtype=cp.float32,
+        ) * self.sigma_vec
+        if beta > 0:
+            scale = float(cp.sqrt(cp.float32(1.0 - beta * beta)))
+            self._eps[:, 0, :] = white[:, 0, :]
+            for t in range(1, H):
+                self._eps[:, t, :] = beta * self._eps[:, t-1, :] + scale * white[:, t, :]
+        else:
+            self._eps[:] = white
 
         # 2. Rollout kernel — K threads, each rolls out H steps
         grid_k, block = self.gpu.get_grid_block(K)
@@ -221,10 +230,14 @@ class MPPI:
         )
 
         # 6. Extract first action, shift horizon (receding horizon).
-        #    cp.roll creates a new array — safe from overlapping-write issues
-        #    that in-place slice assignment can cause on GPU arrays.
-        action     = cp.asnumpy(self.u_bar[0].copy())
+        action_raw = cp.asnumpy(self.u_bar[0].copy())
         self.u_bar = cp.roll(self.u_bar, -1, axis=0)
         self.u_bar[-1] = 0.0
+
+        # 7. EMA smoothing: blend with previous action to reduce jitter.
+        alpha  = self.config.action_alpha
+        action = alpha * self._prev_action + (1.0 - alpha) * action_raw
+        action = np.clip(action, -2.0, 2.0).astype(np.float32)
+        self._prev_action = action.copy()
 
         return action, timing

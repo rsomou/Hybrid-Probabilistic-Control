@@ -35,16 +35,19 @@ class Config:
     # ------------------------------------------------------------------ #
     K: int = 1024                    # number of trajectory samples
     H: int = 30                      # planning horizon
-    lambda_: float = 1.0             # temperature parameter
-    sigma: float = 1.0               # global perturbation scale (multiplied by per-joint weights)
+    lambda_: float = 0.5             # temperature — lower = sharper selection of best trajectories
+    sigma: float = 0.8               # global perturbation scale (multiplied by per-joint weights)
+    noise_beta: float = 0.6          # temporal correlation for perturbation noise.
+                                     # eps[t] = beta*eps[t-1] + sqrt(1-beta^2)*white[t]
+                                     # 0 = i.i.d. (jittery), 1 = constant (no variation)
+                                     # 0.6 = smooth but still exploratory
+    action_alpha: float = 0.3        # EMA smoothing on output action.
+                                     # a_out = alpha*a_prev + (1-alpha)*a_mppi
+                                     # 0 = no smoothing, 1 = frozen
     # Per-joint sigma multipliers for Pusher-v5 (7 joints):
     #   0=shoulder_pan, 1=shoulder_lift, 2=upper_arm_roll,
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll
-    # elbow_flex gets the largest weight — it is the critical joint for folding
-    # the arm inward to close the final gap to the object. Shoulder joints get
-    # moderate scale for gross positioning. Wrist joints are kept small so they
-    # don't drown out the elbow signal in the MPPI weighted average.
-    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 3.0, 0.8, 0.5, 0.5)
+    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.5)
 
     # ------------------------------------------------------------------ #
     # Observation Delay
