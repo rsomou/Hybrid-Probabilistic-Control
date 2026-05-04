@@ -124,19 +124,31 @@ def run(config: Config, render: bool = False, record: bool = False,
     obs, _info = env.reset()
     obs        = obs.astype(np.float32)
 
-    # ---- Stiffen MuJoCo contact for more responsive pushing ---------------
-    model = env.unwrapped.model
-    # Object is nearly massless (8e-6 kg) — increase so contact solver
-    # registers it properly and the fork can grip/push it.
+    # ---- Tune MuJoCo contact so collisions impart more force on object ---
     import mujoco
+    model = env.unwrapped.model
+    data  = env.unwrapped.data
+
+    # Give the object a small but real mass so the contact solver computes
+    # meaningful forces (default XML mass is ~8e-6 kg = basically zero).
     obj_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object")
-    model.body_mass[obj_body_id] = 0.05   # 50g — light but not negligible
-    # Enable friction on fork and object geoms (condim 1→3 adds tangential friction)
+    model.body_mass[obj_body_id] = 0.01   # 10g — very light, easy to push
+
+    # Reduce slide-joint damping so the object keeps moving after contact.
+    # Default is 0.5 which acts as heavy viscous friction, killing velocity.
+    for jname in ["obj_slidey", "obj_slidex"]:
+        jid  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+        dof  = model.jnt_dofadr[jid]
+        model.dof_damping[dof] = 0.1    # reduced from 0.5
+
+    # Stiffen contacts and add friction so the fork grips the puck.
     for gi in [13, 14, 15, 18]:   # wrist fork capsules + object cylinder
-        model.geom_condim[gi] = 3              # enable sliding friction
-        model.geom_friction[gi] = [1.0, 0.005, 0.0001]  # high sliding friction
-        model.geom_solref[gi] = [0.005, 1.0]   # stiffer contact (5ms time const)
-    mujoco.mj_forward(model, env.unwrapped.data)
+        model.geom_condim[gi] = 3              # enable tangential friction
+        model.geom_friction[gi] = [1.0, 0.005, 0.0001]
+        model.geom_solref[gi] = [0.002, 1.0]   # very stiff (2ms time const)
+        model.geom_solimp[gi] = [0.95, 0.99, 0.001, 0.5, 2.0]  # harder contact
+
+    mujoco.mj_forward(model, data)
 
     # Goal is fixed — read directly from obs[20:22] (always correct in v5)
     target = _get_target(obs)
