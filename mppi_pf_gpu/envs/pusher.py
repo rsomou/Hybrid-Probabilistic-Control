@@ -62,6 +62,9 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
 APPROACH_WEIGHT    = 2.0     # weight on 3-D tip-to-object distance (FK-based, includes z)
 ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2 (reduced to allow aggressive bending)
+VELOCITY_WEIGHT    = 3.0     # weight on negative tip-velocity-toward-object (rewards approach speed)
+ALIGNMENT_WEIGHT   = 4.0     # weight on push-direction alignment when in contact zone
+TERMINAL_WEIGHT    = 5.0     # multiplier on obj-target cost at final horizon step
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -454,35 +457,61 @@ class PusherDynamics(AnalyticalDynamics):
     # CPU cost
     # ------------------------------------------------------------------ #
 
-    def cost_numpy(self, state: np.ndarray, action: np.ndarray) -> float:
+    def cost_numpy(self, state: np.ndarray, action: np.ndarray,
+                   t: int = 0, H: int = 1) -> float:
         """
-        Running cost with 3-D approach term.  Uses FK to get the full
-        (x, y, z) fingertip position and measures 3-D distance to the
-        object at (obj_x, obj_y, TABLE_Z).  This creates a unified
-        gradient that bends joints to both approach AND descend.
+        Velocity-aware running cost matching the CUDA cost_pusher.
 
-        cost = APPROACH_WEIGHT * ||tip_3d - obj_3d||
-             + 1.0 * ||obj_xy - target_xy||
-             + ACTION_COST_WEIGHT * ||action||^2
+        Terms:
+          1. 3-D approach distance (FK tip → object)
+          2. Tip velocity toward object (Jacobian-based)
+          3. Push alignment (when near object, reward vel toward target)
+          4. Object-to-target distance (with terminal boost at t == H-1)
+          5. Action regularisation
         """
         state  = np.asarray(state, dtype=np.float64)
         action = np.asarray(action, dtype=np.float64)
 
+        q       = state[0:7]
+        qdot    = state[7:14]
         obj_pos = state[14:16]
+        tip_pos = state[18:20]
 
-        # Full 3-D fingertip position via FK
-        fk_x, fk_y, fk_z = self._forward_kinematics(state[0:7])
-
-        # 3-D tip-to-object distance (object z at table height)
+        # 1. 3-D approach distance
+        fk_x, fk_y, fk_z = self._forward_kinematics(q)
         d_approach = np.sqrt((fk_x - obj_pos[0])**2
                            + (fk_y - obj_pos[1])**2
                            + (fk_z - TABLE_Z)**2)
 
-        dist_obj_target = np.linalg.norm(obj_pos - self._target_pos)
-        action_cost     = float(np.dot(action, action))
+        # 2. Tip velocity toward object
+        Jx, Jy = self._planar_jacobian(q)
+        tvx = float(Jx @ qdot)
+        tvy = float(Jy @ qdot)
+        tip_obj = obj_pos - tip_pos
+        tip_obj_dist = float(np.linalg.norm(tip_obj))
+        vel_toward_obj = 0.0
+        if tip_obj_dist > 1e-6:
+            u = tip_obj / tip_obj_dist
+            vel_toward_obj = -(tvx * u[0] + tvy * u[1])
+
+        # 3. Push alignment
+        obj_tgt = self._target_pos - obj_pos
+        obj_tgt_dist = float(np.linalg.norm(obj_tgt))
+        alignment_cost = 0.0
+        if tip_obj_dist < CONTACT_RADIUS and obj_tgt_dist > 1e-6:
+            g = obj_tgt / obj_tgt_dist
+            alignment_cost = -(tvx * g[0] + tvy * g[1])
+
+        # 4. Object-to-target distance (terminal boost)
+        target_weight = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
+
+        # 5. Action regularisation
+        action_cost = float(np.dot(action, action))
 
         return (APPROACH_WEIGHT * d_approach
-                + 1.0 * dist_obj_target
+                + VELOCITY_WEIGHT * vel_toward_obj
+                + ALIGNMENT_WEIGHT * alignment_cost
+                + target_weight * obj_tgt_dist
                 + ACTION_COST_WEIGHT * action_cost)
 
     # ------------------------------------------------------------------ #
@@ -660,7 +689,10 @@ def _generate_cuda_code():
         f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n"
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
-        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n\n"
+        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
+        f"#define VELOCITY_WEIGHT {VELOCITY_WEIGHT:.6f}f\n"
+        f"#define ALIGNMENT_WEIGHT {ALIGNMENT_WEIGHT:.6f}f\n"
+        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -987,37 +1019,78 @@ __device__ void f_pusher(float* state, const float* action, float dt)
 }
 
 /* ================================================================== */
-/*  cost_pusher: 3-D approach cost that unifies xy-reach and z-lower   */
-/*  Uses FK to get fingertip (x,y,z) and measures full 3-D distance    */
-/*  to object at (obj_x, obj_y, TABLE_Z).  This creates a single      */
-/*  gradient that bends joints to both approach AND descend.           */
+/*  cost_pusher: velocity-aware cost with approach, alignment, terminal */
+/*                                                                      */
+/*  Terms:                                                              */
+/*    1. 3-D approach distance  (FK tip → object)                       */
+/*    2. Tip velocity toward object (rewards closing speed)             */
+/*    3. Push alignment (when near object, reward vel toward target)    */
+/*    4. Object-to-target distance (with terminal boost)                */
+/*    5. Action regularisation                                          */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
-                              const float* target)
+                              const float* target, int t, int H)
 {
+    const float* qdot    = state + 7;
     const float* obj_pos = state + 14;
+    const float* tip_pos = state + 18;
 
     /* Full 3-D fingertip position via FK */
     float fk_x, fk_y, fk_z;
     forward_kinematics(state, &fk_x, &fk_y, &fk_z);
 
-    /* 3-D tip-to-object distance (object z assumed at table height) */
+    /* ---- 1. 3-D approach distance ---- */
     float dx = fk_x - obj_pos[0];
     float dy = fk_y - obj_pos[1];
     float dz = fk_z - TABLE_Z;
     float d_approach = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    /* 2-D object-to-target distance (z irrelevant) */
-    float dx2 = obj_pos[0] - target[0];
-    float dy2 = obj_pos[1] - target[1];
-    float d_target = sqrtf(dx2*dx2 + dy2*dy2);
+    /* ---- 2. Tip velocity toward object (Jacobian-based) ---- */
+    /* Compute 2-D tip velocity via positional Jacobian */
+    float Jx[NUM_JOINTS], Jy[NUM_JOINTS], tvx, tvy;
+    planar_jacobian(state, qdot, Jx, Jy, &tvx, &tvy);
 
-    /* Action cost */
+    /* Unit vector from tip to object (2-D) */
+    float tip_obj_dx = obj_pos[0] - tip_pos[0];
+    float tip_obj_dy = obj_pos[1] - tip_pos[1];
+    float tip_obj_dist = sqrtf(tip_obj_dx*tip_obj_dx + tip_obj_dy*tip_obj_dy);
+    float vel_toward_obj = 0.0f;
+    if (tip_obj_dist > 1e-6f) {
+        float ux = tip_obj_dx / tip_obj_dist;
+        float uy = tip_obj_dy / tip_obj_dist;
+        /* Positive = moving toward object; negate so cost decreases */
+        vel_toward_obj = -(tvx * ux + tvy * uy);
+    }
+
+    /* ---- 3. Push alignment: when near object, reward velocity ---- */
+    /*         component along obj → target direction                 */
+    float obj_tgt_dx = target[0] - obj_pos[0];
+    float obj_tgt_dy = target[1] - obj_pos[1];
+    float obj_tgt_dist = sqrtf(obj_tgt_dx*obj_tgt_dx + obj_tgt_dy*obj_tgt_dy);
+    float alignment_cost = 0.0f;
+    if (tip_obj_dist < CONTACT_RADIUS && obj_tgt_dist > 1e-6f) {
+        float gx = obj_tgt_dx / obj_tgt_dist;
+        float gy = obj_tgt_dy / obj_tgt_dist;
+        /* Negative dot = tip velocity is away from target direction */
+        float push_dot = tvx * gx + tvy * gy;
+        alignment_cost = -push_dot;  /* lower cost when pushing toward target */
+    }
+
+    /* ---- 4. Object-to-target distance (with terminal boost) ---- */
+    float d_target = sqrtf(obj_tgt_dx*obj_tgt_dx + obj_tgt_dy*obj_tgt_dy);
+    float target_weight = 1.0f;
+    if (t == H - 1) {
+        target_weight += TERMINAL_WEIGHT;
+    }
+
+    /* ---- 5. Action regularisation ---- */
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
     return APPROACH_WEIGHT * d_approach
-         + 1.0f * d_target
+         + VELOCITY_WEIGHT * vel_toward_obj
+         + ALIGNMENT_WEIGHT * alignment_cost
+         + target_weight * d_target
          + ACTION_COST_WEIGHT * act2;
 }
 """

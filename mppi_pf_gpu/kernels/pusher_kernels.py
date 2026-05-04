@@ -55,7 +55,7 @@ void mppi_rollout(
         }
 
         // Accumulate running cost before state transition
-        total_cost += cost_pusher(state, action, target);
+        total_cost += cost_pusher(state, action, target, t, H);
 
         // Advance state in place
         f_pusher(state, action, dt);
