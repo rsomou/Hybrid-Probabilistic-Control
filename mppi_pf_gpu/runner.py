@@ -331,10 +331,6 @@ def run(config: Config, render: bool = False, record: bool = False,
                 p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
                 n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
 
-            # Particle obj_pos spread
-            obj_mean = p_obj.mean(axis=0)
-            obj_std  = p_obj.std(axis=0)
-
             print(
                 f"  DIAG step {t}: "
                 f"real_tip=({real_tip[0]:+.3f},{real_tip[1]:+.3f},{real_tip[2]:+.3f}) "
