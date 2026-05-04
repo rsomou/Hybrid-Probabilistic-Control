@@ -140,12 +140,23 @@ def run(config: Config, render: bool = False, record: bool = False,
         dof  = model.jnt_dofadr[jid]
         model.dof_damping[dof] = 2.0    # high viscous friction
 
-    # Stiffen contacts and add friction so the fork grips the puck.
+    # Stiffen contacts to near-rigid so the fork cannot penetrate the object.
+    # solref[0]=0.001 → 1 ms time-constant (≈ rigid spring).
+    # solimp approaching 1.0 → maximum constraint impedance (near-zero penetration).
+    # margin=0 / gap=0 → contact force activates only on actual overlap, no soft zone.
+    # Newton solver + more iterations → constraint solver converges to near-zero penetration.
+    model.opt.solver     = 2    # 0=PGS, 1=CG, 2=Newton — Newton is most accurate
+    model.opt.iterations = 100  # was default 100; keep high for hard contacts
+    model.opt.tolerance  = 1e-10  # tighter convergence
+
     for gi in [13, 14, 15, 18]:   # wrist fork capsules + object cylinder
-        model.geom_condim[gi] = 3              # enable tangential friction
+        model.geom_condim[gi]  = 3                           # tangential friction
         model.geom_friction[gi] = [1.0, 0.005, 0.0001]
-        model.geom_solref[gi] = [0.002, 1.0]   # very stiff (2ms time const)
-        model.geom_solimp[gi] = [0.95, 0.99, 0.001, 0.5, 2.0]  # harder contact
+        model.geom_solref[gi]  = [0.001, 1.0]               # 1 ms — near-rigid
+        model.geom_solimp[gi]  = [0.99, 0.9999, 0.0001, 0.5, 2.0]  # max impedance
+        model.geom_margin[gi]  = 0.0                         # no soft detection zone
+        model.geom_gap[gi]     = 0.0                         # no free zone inside margin
+        model.geom_priority[gi] = 1                          # these params win the mix
 
     mujoco.mj_forward(model, data)
 
