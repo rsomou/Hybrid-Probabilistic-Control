@@ -61,14 +61,11 @@ FRAME_SKIP     = 5          # number of inner integration substeps per control s
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
 # --- Cost function weights ---
+# obj→goal is the PRIMARY signal; fork→obj is a lightweight guide.
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
-APPROACH_WEIGHT    = 10.0    # weight on 3-D fork-to-object distance
-Z_COST_WEIGHT      = 8.0     # extra penalty on fork being above table plane
-FLOOR_WEIGHT       = 20.0    # penalty for fork below table (unrealizable in MuJoCo)
-ACTION_COST_WEIGHT = 0.005   # weight on ||action||^2
-TERMINAL_WEIGHT    = 10.0    # extra multiplier on obj-target cost at final horizon step
-CONTACT_BONUS      = 8.0     # amplitude of exponential contact-funnel reward
-CONTACT_SCALE      = 0.20    # length-scale of funnel
+GOAL_WEIGHT        = 10.0    # weight on obj-to-goal distance (THE objective)
+APPROACH_WEIGHT    = 2.0     # lightweight guide: fork-to-object 3D distance
+ACTION_COST_WEIGHT = 0.01    # weight on ||action||^2
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -503,28 +500,18 @@ class PusherDynamics(AnalyticalDynamics):
         obj_pos = state[14:16]
         fk_x, fk_y, fk_z = state[18], state[19], state[20]
 
-        # 1. 3-D fork-to-object distance
-        dz_approach = fk_z - TABLE_Z
-        d_3d = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2 + dz_approach**2)
+        # 1. Object-to-goal distance (PRIMARY objective)
+        obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Above-table penalty
-        dz = max(dz_approach, 0.0)
+        # 2. Fork-to-object 3D distance (lightweight approach guide)
+        dz = fk_z - TABLE_Z
+        d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2 + dz**2)
 
-        # 3. Below-table penalty (unrealizable in MuJoCo)
-        floor_violation = max(TABLE_Z - fk_z, 0.0)
-
-        # 4. Object-to-goal distance (with terminal boost)
-        obj_tgt_dist  = float(np.linalg.norm(obj_pos - self._target_pos))
-        target_weight = 1.0 + (TERMINAL_WEIGHT if t == H - 1 else 0.0)
-
-        # 5. Action regularisation
+        # 3. Action regularisation
         action_cost = float(np.dot(action, action))
 
-        return (APPROACH_WEIGHT    * d_3d
-                - CONTACT_BONUS    * np.exp(-d_3d / CONTACT_SCALE)
-                + Z_COST_WEIGHT    * dz
-                + FLOOR_WEIGHT     * floor_violation
-                + target_weight    * obj_tgt_dist
+        return (GOAL_WEIGHT        * obj_tgt_dist
+                + APPROACH_WEIGHT   * d_fork_obj
                 + ACTION_COST_WEIGHT * action_cost)
 
     # ------------------------------------------------------------------ #
@@ -699,13 +686,9 @@ def _generate_cuda_code():
         "#define INNER_DT        0.01f\n"
         f"#define ARMATURE_VAL    {ARMATURE:.6f}f\n"
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
+        f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
-        f"#define Z_COST_WEIGHT {Z_COST_WEIGHT:.6f}f\n"
-        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
-        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
-        f"#define CONTACT_BONUS {CONTACT_BONUS:.6f}f\n"
-        f"#define CONTACT_SCALE {CONTACT_SCALE:.6f}f\n"
-        f"#define FLOOR_WEIGHT {FLOOR_WEIGHT:.6f}f\n\n"
+        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1052,11 +1035,9 @@ __device__ void f_pusher(float* state, const float* action, float dt)
 /* ================================================================== */
 /*  cost_pusher: split-signal approach cost                            */
 /*                                                                      */
-/*  1. 3-D fork-to-object distance (APPROACH_WEIGHT)                    */
-/*  2. Fork above table penalty   (Z_COST_WEIGHT)                      */
-/*  3. Fork below table penalty   (FLOOR_WEIGHT)                       */
-/*  4. Object-to-goal distance    (1 + TERMINAL_WEIGHT at last step)   */
-/*  5. Action regularisation      (ACTION_COST_WEIGHT)                 */
+/*  1. Object-to-goal distance  (GOAL_WEIGHT) — PRIMARY                */
+/*  2. Fork-to-object 3D dist   (APPROACH_WEIGHT) — lightweight guide   */
+/*  3. Action regularisation     (ACTION_COST_WEIGHT)                   */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
@@ -1068,34 +1049,23 @@ __device__ float cost_pusher(const float* state, const float* action,
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* ---- 1. 3-D fork-to-object distance (drives approach + descent) ---- */
-    float dx = fk_x - obj_pos[0];
-    float dy = fk_y - obj_pos[1];
-    float dz_approach = fk_z - TABLE_Z;
-    float d_3d = sqrtf(dx*dx + dy*dy + dz_approach*dz_approach);
-
-    /* ---- 2. Above-table penalty (extra incentive to descend) ---- */
-    float dz = fmaxf(dz_approach, 0.0f);
-
-    /* ---- 3. Below-table penalty (unrealizable in MuJoCo) ---- */
-    float floor_violation = fmaxf(TABLE_Z - fk_z, 0.0f);
-
-    /* ---- 4. Object-to-goal distance (with terminal boost) ---- */
+    /* ---- 1. Object-to-goal distance (PRIMARY objective) ---- */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
-    float target_weight = 1.0f;
-    if (t == H - 1) target_weight += TERMINAL_WEIGHT;
 
-    /* ---- 5. Action regularisation ---- */
+    /* ---- 2. Fork-to-object 3D distance (lightweight guide) ---- */
+    float dx = fk_x - obj_pos[0];
+    float dy = fk_y - obj_pos[1];
+    float dz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
+
+    /* ---- 3. Action regularisation ---- */
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
-    return APPROACH_WEIGHT * d_3d
-         - CONTACT_BONUS   * expf(-d_3d / CONTACT_SCALE)
-         + Z_COST_WEIGHT   * dz
-         + FLOOR_WEIGHT    * floor_violation
-         + target_weight   * d_target
+    return GOAL_WEIGHT      * d_target
+         + APPROACH_WEIGHT  * d_fork_obj
          + ACTION_COST_WEIGHT * act2;
 }
 """
