@@ -129,17 +129,16 @@ def run(config: Config, render: bool = False, record: bool = False,
     model = env.unwrapped.model
     data  = env.unwrapped.data
 
-    # Give the object a small but real mass so the contact solver computes
-    # meaningful forces (default XML mass is ~8e-6 kg = basically zero).
+    # Heavier object = needs sustained force to move, doesn't fly away on contact.
     obj_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "object")
-    model.body_mass[obj_body_id] = 0.01   # 10g — very light, easy to push
+    model.body_mass[obj_body_id] = 0.5   # 500g — substantial, needs real pushing
 
-    # Reduce slide-joint damping so the object keeps moving after contact.
-    # Default is 0.5 which acts as heavy viscous friction, killing velocity.
+    # Higher damping = object decelerates quickly after contact ends.
+    # Acts like table friction — the puck stops near where you pushed it.
     for jname in ["obj_slidey", "obj_slidex"]:
         jid  = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jname)
         dof  = model.jnt_dofadr[jid]
-        model.dof_damping[dof] = 0.1    # reduced from 0.5
+        model.dof_damping[dof] = 2.0    # high viscous friction
 
     # Stiffen contacts and add friction so the fork grips the puck.
     for gi in [13, 14, 15, 18]:   # wrist fork capsules + object cylinder
