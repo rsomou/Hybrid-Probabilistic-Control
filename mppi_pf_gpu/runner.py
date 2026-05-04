@@ -261,7 +261,8 @@ def run(config: Config, render: bool = False, record: bool = False,
         t_gpu_end = time.perf_counter()
 
         # ========================= CPU / ENV WORK ===========================
-        prev_delayed_obs = delayed_obs
+        if not no_pf:
+            prev_delayed_obs = delayed_obs
 
         obs, reward, terminated, truncated, _info = env.step(action)
         obs = obs.astype(np.float32)
