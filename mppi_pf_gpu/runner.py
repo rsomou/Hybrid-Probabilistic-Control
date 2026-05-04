@@ -59,19 +59,38 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
     return obs[20:22].astype(np.float32)
 
 
+def _obs_to_state(obs: np.ndarray) -> np.ndarray:
+    """
+    Build a full 20-dim state vector directly from a Pusher-v5 observation.
+    Used in --no-pf mode to give MPPI perfect state information.
+
+    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)]
+    Obs layout:   [q(7), qdot(7), tip_xyz(3), obj_xyz(3), goal_xyz(3)]
+    """
+    state = np.zeros(20, dtype=np.float32)
+    state[0:7]   = obs[0:7]    # joint angles
+    state[7:14]  = obs[7:14]   # joint velocities
+    state[14:16] = obs[17:19]  # object xy (obs[17:20] is obj_xyz; take x,y)
+    state[16:18] = 0.0         # object velocity — not in obs, assume zero
+    state[18:20] = obs[14:16]  # fingertip xy (obs[14:17] is tip_xyz; take x,y)
+    return state
+
+
 # --------------------------------------------------------------------------- #
 # Main control loop
 # --------------------------------------------------------------------------- #
 
-def run(config: Config, render: bool = False, record: bool = False):
+def run(config: Config, render: bool = False, record: bool = False,
+        no_pf: bool = False):
     """
-    Execute one episode of Pusher-v5 with MPPI + Particle Filter.
+    Execute one episode of Pusher-v5 with MPPI (+ Particle Filter unless no_pf).
 
     Parameters
     ----------
     config : Config
     render : bool — if True opens the MuJoCo viewer
     record : bool — if True saves an MP4 video to ./videos/
+    no_pf  : bool — if True bypass the PF; feed MPPI perfect state from obs
 
     Returns
     -------
@@ -143,83 +162,96 @@ def run(config: Config, render: bool = False, record: bool = False):
         step_start = time.perf_counter()
 
         # ========================= GPU WORK =================================
-        #
-        # Observation-delay protocol:
-        #   PF particles track belief at time (t − d).  Each step we feed
-        #   the DELAYED observation (from d steps ago) to pf.update().
-        #   For MPPI we need current-time estimates, so sample_current()
-        #   propagates temporary copies through the d recent actions.
 
-        # -- Delayed observation ------------------------------------------
-        delayed_obs = obs_buffer[0]          # oldest buffered obs (d steps old)
-
-        # PF inject + propagate: only after the action buffer has d+1 entries
-        # so that action_buffer[0] is the action from the DELAYED transition
-        # (the action applied at step t-d-1 that moved state from
-        #  prev_delayed_obs to delayed_obs).
-        if len(action_buffer) > config.obs_delay:
-            delayed_action = action_buffer[0]
-            pf.inject_observation(prev_delayed_obs)
-            pf.propagate(delayed_action)
-
-        # Weight update against delayed observation
-        pf.update(delayed_obs)
-
-        ess = pf.effective_sample_size()
-
-        if ess < config.resample_threshold * config.N:
-            pf.resample()
-
-        # -- Delay-aware state estimate for MPPI --------------------------
-        pf.inject_observation(delayed_obs)
-
-        t_delay_start = time.perf_counter()
-        # Use PF weighted mean as a SINGLE initial state for all K MPPI
-        # rollouts.  Sampling K different particle states introduces
-        # initial-condition noise (varying obj_pos -> varying obj-target
-        # cost) that DOMINATES the action-quality signal, preventing
-        # MPPI from selecting approach-improving trajectories.
-        mean_gpu = pf.estimate_gpu()          # (1, state_dim) on GPU
-
-        if len(action_buffer) > config.obs_delay:
-            recent_actions = list(action_buffer)[1:]   # last d actions
+        if no_pf:
+            # ---- Perfect-information mode: bypass PF entirely --------------
+            # Build state directly from the current observation.
+            state_vec   = _obs_to_state(obs)
+            state_gpu   = cp.asarray(state_vec, dtype=cp.float32).reshape(1, -1)
+            initial_states = cp.repeat(state_gpu, mppi.K, axis=0)
+            ess = float(config.N)   # sentinel — PF not running
+            cp.cuda.Device(config.device_id).synchronize()
+            t_delay_start = t_delay_end = time.perf_counter()
+            T_pf_delay_ms = 0.0
         else:
-            recent_actions = list(action_buffer)        # warmup: all we have
+            # ---- Normal PF path --------------------------------------------
+            #
+            # Observation-delay protocol:
+            #   PF particles track belief at time (t − d).  Each step we feed
+            #   the DELAYED observation (from d steps ago) to pf.update().
+            #   For MPPI we need current-time estimates, so sample_current()
+            #   propagates temporary copies through the d recent actions.
 
-        # Propagate mean state through delay actions ON GPU (single particle,
-        # zero noise) — avoids the ~85ms CPU RNEA bottleneck.
-        state_dim = dynamics.state_dim
-        zero_noise = cp.zeros((1, state_dim), dtype=cp.float32)
-        for act in recent_actions:
-            act_gpu = cp.asarray(act, dtype=cp.float32)
-            pf._propagate_kernel(
-                (1,), (1,),
-                (
-                    mean_gpu,
-                    act_gpu,
-                    zero_noise,
-                    cp.float32(0.0),   # no joint noise
-                    cp.float32(0.0),   # no obj noise
-                    cp.float32(config.dt),
-                    np.int32(1),
-                ),
-            )
+            # -- Delayed observation ------------------------------------------
+            delayed_obs = obs_buffer[0]          # oldest buffered obs (d steps old)
 
-        # Inject the most recent REAL tip position into the mean state.
-        # The analytical 2-link FK drifts up to 0.1m from the real 3D tip,
-        # causing MPPI to misjudge tip-object distance and plan poorly.
-        # obs_buffer[-1] has the latest observation (step t-1); use its
-        # real fingertip xy to correct the initial state for planning.
-        latest_obs = obs_buffer[-1] if len(obs_buffer) > 0 else obs
-        real_tip_xy = cp.asarray(latest_obs[14:16].astype(np.float32))
-        mean_gpu[0, 18] = real_tip_xy[0]
-        mean_gpu[0, 19] = real_tip_xy[1]
+            # PF inject + propagate: only after the action buffer has d+1 entries
+            # so that action_buffer[0] is the action from the DELAYED transition
+            # (the action applied at step t-d-1 that moved state from
+            #  prev_delayed_obs to delayed_obs).
+            if len(action_buffer) > config.obs_delay:
+                delayed_action = action_buffer[0]
+                pf.inject_observation(prev_delayed_obs)
+                pf.propagate(delayed_action)
 
-        # Tile the single state across all K MPPI rollout starts
-        initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
-        cp.cuda.Device(config.device_id).synchronize()
-        t_delay_end = time.perf_counter()
-        T_pf_delay_ms = (t_delay_end - t_delay_start) * 1e3
+            # Weight update against delayed observation
+            pf.update(delayed_obs)
+
+            ess = pf.effective_sample_size()
+
+            if ess < config.resample_threshold * config.N:
+                pf.resample()
+
+            # -- Delay-aware state estimate for MPPI --------------------------
+            pf.inject_observation(delayed_obs)
+
+            t_delay_start = time.perf_counter()
+            # Use PF weighted mean as a SINGLE initial state for all K MPPI
+            # rollouts.  Sampling K different particle states introduces
+            # initial-condition noise (varying obj_pos -> varying obj-target
+            # cost) that DOMINATES the action-quality signal, preventing
+            # MPPI from selecting approach-improving trajectories.
+            mean_gpu = pf.estimate_gpu()          # (1, state_dim) on GPU
+
+            if len(action_buffer) > config.obs_delay:
+                recent_actions = list(action_buffer)[1:]   # last d actions
+            else:
+                recent_actions = list(action_buffer)        # warmup: all we have
+
+            # Propagate mean state through delay actions ON GPU (single particle,
+            # zero noise) — avoids the ~85ms CPU RNEA bottleneck.
+            state_dim = dynamics.state_dim
+            zero_noise = cp.zeros((1, state_dim), dtype=cp.float32)
+            for act in recent_actions:
+                act_gpu = cp.asarray(act, dtype=cp.float32)
+                pf._propagate_kernel(
+                    (1,), (1,),
+                    (
+                        mean_gpu,
+                        act_gpu,
+                        zero_noise,
+                        cp.float32(0.0),   # no joint noise
+                        cp.float32(0.0),   # no obj noise
+                        cp.float32(config.dt),
+                        np.int32(1),
+                    ),
+                )
+
+            # Inject the most recent REAL tip position into the mean state.
+            # The analytical 2-link FK drifts up to 0.1m from the real 3D tip,
+            # causing MPPI to misjudge tip-object distance and plan poorly.
+            # obs_buffer[-1] has the latest observation (step t-1); use its
+            # real fingertip xy to correct the initial state for planning.
+            latest_obs = obs_buffer[-1] if len(obs_buffer) > 0 else obs
+            real_tip_xy = cp.asarray(latest_obs[14:16].astype(np.float32))
+            mean_gpu[0, 18] = real_tip_xy[0]
+            mean_gpu[0, 19] = real_tip_xy[1]
+
+            # Tile the single state across all K MPPI rollout starts
+            initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
+            cp.cuda.Device(config.device_id).synchronize()
+            t_delay_end = time.perf_counter()
+            T_pf_delay_ms = (t_delay_end - t_delay_start) * 1e3
 
         # MPPI planning
         action, mppi_timing = mppi.compute_action(initial_states)
@@ -236,9 +268,10 @@ def run(config: Config, render: bool = False, record: bool = False):
 
         # -- Sensor noise + delay buffers ---------------------------------
         noisy_obs = obs.copy()
-        noisy_obs += np.random.normal(
-            0.0, config.sensor_noise_std, obs.shape,
-        ).astype(np.float32)
+        if not no_pf:
+            noisy_obs += np.random.normal(
+                0.0, config.sensor_noise_std, obs.shape,
+            ).astype(np.float32)
         obs_buffer.append(noisy_obs)
         action_buffer.append(action.copy())
 
@@ -287,16 +320,15 @@ def run(config: Config, render: bool = False, record: bool = False):
                                    + (anal_tip[1] - real_tip[1])**2)
             tip_obj_dist = np.sqrt((real_tip[0] - real_obj[0])**2
                                    + (real_tip[1] - real_obj[1])**2)
-            anal_obj_dist = np.sqrt((anal_tip[0] - real_obj[0])**2
-                                    + (anal_tip[1] - real_obj[1])**2)
 
-            # Check how many particles have obj_pos within contact radius
-            # of the INJECTED tip position (state[18:20])
-            particles_cpu = cp.asnumpy(pf.particles)
-            p_obj = particles_cpu[:, 14:16]                  # (N, 2)
-            p_tip = particles_cpu[:, 18:20]                  # (N, 2) injected real tip
-            p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
-            n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
+            if not no_pf:
+                # Check how many particles have obj_pos within contact radius
+                # of the INJECTED tip position (state[18:20])
+                particles_cpu = cp.asnumpy(pf.particles)
+                p_obj = particles_cpu[:, 14:16]              # (N, 2)
+                p_tip = particles_cpu[:, 18:20]              # (N, 2) injected real tip
+                p_dists = np.linalg.norm(p_obj - p_tip, axis=1)
+                n_contact = int(np.sum(p_dists < CONTACT_RADIUS))
 
             # Particle obj_pos spread
             obj_mean = p_obj.mean(axis=0)
@@ -308,31 +340,27 @@ def run(config: Config, render: bool = False, record: bool = False):
                 f"anal_tip=({anal_tip[0]:+.3f},{anal_tip[1]:+.3f}) "
                 f"FK_err={tip_err:.4f}m"
             )
-            # Use the first particle's tip_pos as representative (all same after inject)
-            injected_tip = particles_cpu[0, 18:20] if particles_cpu.shape[1] > 18 else np.array(anal_tip)
-            inj_obj_dist = np.sqrt((injected_tip[0] - real_obj[0])**2
-                                   + (injected_tip[1] - real_obj[1])**2)
             print(
                 f"         real_obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
                 f"tip→obj(real)={tip_obj_dist:.3f}m "
-                f"tip→obj(injected)={inj_obj_dist:.3f}m "
                 f"contact_r={CONTACT_RADIUS}"
             )
-            # Weight diagnostics
-            w_cpu = cp.asnumpy(pf.weights)
-            w_max = w_cpu.max()
-            w_min = w_cpu[w_cpu > 0].min() if (w_cpu > 0).any() else 0.0
-            w_ratio = w_max / w_min if w_min > 0 else float('inf')
-
-            print(
-                f"         particles: obj_mean=({obj_mean[0]:+.3f},{obj_mean[1]:+.3f}) "
-                f"obj_std=({obj_std[0]:.3f},{obj_std[1]:.3f}) "
-                f"n_in_contact={n_contact}/{config.N}"
-            )
-            print(
-                f"         weights: max={w_max:.6f} min={w_min:.6f} "
-                f"ratio={w_ratio:.1f} std={w_cpu.std():.6f}"
-            )
+            if not no_pf:
+                obj_mean = p_obj.mean(axis=0)
+                obj_std  = p_obj.std(axis=0)
+                w_cpu = cp.asnumpy(pf.weights)
+                w_max = w_cpu.max()
+                w_min = w_cpu[w_cpu > 0].min() if (w_cpu > 0).any() else 0.0
+                w_ratio = w_max / w_min if w_min > 0 else float('inf')
+                print(
+                    f"         particles: obj_mean=({obj_mean[0]:+.3f},{obj_mean[1]:+.3f}) "
+                    f"obj_std=({obj_std[0]:.3f},{obj_std[1]:.3f}) "
+                    f"n_in_contact={n_contact}/{config.N}"
+                )
+                print(
+                    f"         weights: max={w_max:.6f} min={w_min:.6f} "
+                    f"ratio={w_ratio:.1f} std={w_cpu.std():.6f}"
+                )
             print(
                 f"         action={np.array2string(action, precision=2, separator=',')}"
             )
@@ -397,6 +425,8 @@ if __name__ == "__main__":
                         help="Record MP4 video to ./videos/")
     parser.add_argument("--no-timing", action="store_true",
                         help="Suppress per-step timing output")
+    parser.add_argument("--no-pf",    action="store_true",
+                        help="Bypass particle filter; give MPPI perfect state from obs")
     args = parser.parse_args()
 
     cfg = Config(
@@ -411,4 +441,4 @@ if __name__ == "__main__":
         enable_timing  = not args.no_timing,
     )
 
-    run(cfg, render=args.render, record=args.record)
+    run(cfg, render=args.render, record=args.record, no_pf=args.no_pf)
