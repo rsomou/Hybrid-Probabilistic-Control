@@ -38,7 +38,7 @@ import numpy as np
 import cupy as cp
 
 from config import Config
-from envs.pusher import PusherDynamics, CONTACT_RADIUS
+from envs.pusher import PusherDynamics, CONTACT_RADIUS, TABLE_Z
 from gpu_utils import GPUUtils
 from particle_filter import ParticleFilter
 from mppi import MPPI
@@ -61,18 +61,19 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
 
 def _obs_to_state(obs: np.ndarray) -> np.ndarray:
     """
-    Build a full 20-dim state vector directly from a Pusher-v5 observation.
+    Build a full 21-dim state vector directly from a Pusher-v5 observation.
     Used in --no-pf mode to give MPPI perfect state information.
 
-    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_pos(2)]
+    State layout: [q(7), qdot(7), obj_pos(2), obj_vel(2), tip_xy(2), tip_z(1)]
     Obs layout:   [q(7), qdot(7), tip_xyz(3), obj_xyz(3), goal_xyz(3)]
     """
-    state = np.zeros(20, dtype=np.float32)
+    state = np.zeros(21, dtype=np.float32)
     state[0:7]   = obs[0:7]    # joint angles
     state[7:14]  = obs[7:14]   # joint velocities
     state[14:16] = obs[17:19]  # object xy (obs[17:20] is obj_xyz; take x,y)
     state[16:18] = 0.0         # object velocity — not in obs, assume zero
     state[18:20] = obs[14:16]  # fingertip xy (obs[14:17] is tip_xyz; take x,y)
+    state[20]    = obs[16]     # fingertip z
     return state
 
 
@@ -152,6 +153,7 @@ def run(config: Config, render: bool = False, record: bool = False,
     print(f"  q0         = {np.array2string(q0, precision=3, separator=',')}")
     print(f"  real_tip0  = ({tip0[0]:+.3f}, {tip0[1]:+.3f}, {tip0[2]:+.3f})")
     print(f"  anal_tip0  = ({anal0[0]:+.3f}, {anal0[1]:+.3f}, {anal0[2]:+.3f})")
+    print(f"  tip_z gap  = {tip0[2] - TABLE_Z:+.4f}  (tip_z={tip0[2]:+.4f}, table_z={TABLE_Z:.4f})")
     print(f"  real_obj0  = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
     print(f"  goal       = ({goal0[0]:+.3f}, {goal0[1]:+.3f}, {goal0[2]:+.3f})")
     print(f"  target(2d) = ({target[0]:+.3f}, {target[1]:+.3f})")
@@ -237,15 +239,15 @@ def run(config: Config, render: bool = False, record: bool = False,
                     ),
                 )
 
-            # Inject the most recent REAL tip position into the mean state.
-            # The analytical 2-link FK drifts up to 0.1m from the real 3D tip,
-            # causing MPPI to misjudge tip-object distance and plan poorly.
-            # obs_buffer[-1] has the latest observation (step t-1); use its
-            # real fingertip xy to correct the initial state for planning.
+            # Inject the most recent REAL tip position (xyz) into the mean state.
+            # The analytical FK has residual error; using the real MuJoCo tip
+            # position ensures MPPI starts planning from the correct 3D position.
+            # obs_buffer[-1] has the latest observation (step t-1).
             latest_obs = obs_buffer[-1] if len(obs_buffer) > 0 else obs
             real_tip_xy = cp.asarray(latest_obs[14:16].astype(np.float32))
             mean_gpu[0, 18] = real_tip_xy[0]
             mean_gpu[0, 19] = real_tip_xy[1]
+            mean_gpu[0, 20] = cp.float32(float(latest_obs[16]))   # tip_z
 
             # Tile the single state across all K MPPI rollout starts
             initial_states = cp.repeat(mean_gpu, mppi.K, axis=0)
