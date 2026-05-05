@@ -62,13 +62,8 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
-GOAL_WEIGHT     = 10.0    # weight on obj-to-goal distance (THE objective)
-APPROACH_WEIGHT = 5.0     # distance from fork to a target point past the object along
-                           # the push axis.  The fork is pulled THROUGH the contact zone
-                           # into the object, which triggers contact and pushes it toward
-                           # the goal.  Encodes both proximity and direction.
-BEHIND_DIST     = -0.05   # negative = target point is 5cm PAST the object toward the goal.
-                           # Fork must pass through the object to reach it → guaranteed contact.
+GOAL_WEIGHT     = 10.0    # weight on d(obj, goal) — THE objective
+APPROACH_WEIGHT = 5.0     # weight on d(fork, obj) in 3D — drives arm toward the object
 TERMINAL_WEIGHT = 8.0     # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
@@ -509,15 +504,12 @@ class PusherDynamics(AnalyticalDynamics):
         # 1. Object-to-goal distance (PRIMARY objective)
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Fork to target point past the object along the push axis.
-        #    BEHIND_DIST < 0 places target on the goal side of the object,
-        #    pulling the fork through the contact zone.
-        push_dir  = (self._target_pos - obj_pos) / (obj_tgt_dist + 1e-4)
-        behind_pt = obj_pos - BEHIND_DIST * push_dir
-        d_fork_target = np.sqrt((fk_x - behind_pt[0])**2
-                                + (fk_y - behind_pt[1])**2)  # XY only
+        # 2. Fork-to-object 3D distance (includes z — forces arm to descend)
+        dz = fk_z - TABLE_Z
+        d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
+                             + (fk_y - obj_pos[1])**2 + dz**2)
 
-        return GOAL_WEIGHT * obj_tgt_dist + APPROACH_WEIGHT * d_fork_target
+        return GOAL_WEIGHT * obj_tgt_dist + APPROACH_WEIGHT * d_fork_obj
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -693,7 +685,6 @@ def _generate_cuda_code():
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
         f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
-        f"#define BEHIND_DIST {BEHIND_DIST:.6f}f\n"
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
@@ -1058,25 +1049,19 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* Target fork position: BEHIND_DIST past the object along the push axis.
-       BEHIND_DIST < 0 means the target is on the GOAL side of the object,
-       so the fork is pulled through the contact zone into the object. */
-    float inv_dt = 1.0f / (d_target + 1e-4f);
-    float px = (target[0] - obj_pos[0]) * inv_dt;
-    float py = (target[1] - obj_pos[1]) * inv_dt;
-    float bx = obj_pos[0] - BEHIND_DIST * px;
-    float by = obj_pos[1] - BEHIND_DIST * py;
-    float ddx = fk_x - bx;
-    float ddy = fk_y - by;
-    float d_fork_target = sqrtf(ddx*ddx + ddy*ddy);   /* XY only — z gap is unreachable */
+    /* Fork-to-object 3D distance */
+    float ddx = fk_x - obj_pos[0];
+    float ddy = fk_y - obj_pos[1];
+    float ddz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_target);
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj);
 }
 
 /* ================================================================== */
 /*  cost_pusher: two-term running cost                                  */
-/*  1. Object-to-goal distance  (GOAL_WEIGHT)   — PRIMARY              */
-/*  2. Fork-to-behind-target    (APPROACH_WEIGHT) — approach + align   */
+/*  1. d(obj, goal) in 2D       (GOAL_WEIGHT)     — PRIMARY            */
+/*  2. d(fork, obj) in 3D       (APPROACH_WEIGHT)  — approach guide     */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
@@ -1087,23 +1072,18 @@ __device__ float cost_pusher(const float* state, const float* action,
     float fk_y = state[19];
     float fk_z = state[20];
 
+    /* Object-to-goal 2D */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* Target fork position: BEHIND_DIST past the object along push axis.
-       BEHIND_DIST < 0 places the target on the goal side of the object,
-       pulling the fork through the contact zone → guaranteed contact. */
-    float inv_dt = 1.0f / (d_target + 1e-4f);
-    float px = (target[0] - obj_pos[0]) * inv_dt;
-    float py = (target[1] - obj_pos[1]) * inv_dt;
-    float bx = obj_pos[0] - BEHIND_DIST * px;
-    float by = obj_pos[1] - BEHIND_DIST * py;
-    float dx = fk_x - bx;
-    float dy = fk_y - by;
-    float d_fork_target = sqrtf(dx*dx + dy*dy);   /* XY only — z gap is unreachable */
+    /* Fork-to-object 3D (includes z — forces arm to descend toward table) */
+    float dx = fk_x - obj_pos[0];
+    float dy = fk_y - obj_pos[1];
+    float dz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    return GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_target;
+    return GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj;
 }
 """
 
