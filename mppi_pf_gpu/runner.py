@@ -166,8 +166,9 @@ def run(config: Config, render: bool = False, record: bool = False,
     mppi.set_target(target)
     pf.initialize(obs)
 
-    total_reward = 0.0
-    timing_log   = []
+    total_reward   = 0.0
+    timing_log     = []
+    resample_count = 0    # number of times PF resampled this episode
 
     # ---- Observation-delay buffers -----------------------------------------
     # obs_buffer:    maxlen = d+1  (stores delayed obs window)
@@ -235,6 +236,7 @@ def run(config: Config, render: bool = False, record: bool = False,
 
             if ess < config.resample_threshold * config.N:
                 pf.resample()
+                resample_count += 1
 
             # -- Delay-aware state estimate for MPPI --------------------------
             pf.inject_observation(delayed_obs)
@@ -374,9 +376,22 @@ def run(config: Config, render: bool = False, record: bool = False,
                 w_cpu = cp.asnumpy(pf.weights)
                 w_max = w_cpu.max()
                 w_min = w_cpu[w_cpu > 0].min() if (w_cpu > 0).any() else 0.0
+
+                # Spread (std) of object position belief
+                obj_std_x = float(p_obj[:, 0].std())
+                obj_std_y = float(p_obj[:, 1].std())
+
+                # PF tracking error vs ground truth
+                pf_mean_obj = p_obj.mean(axis=0)
+                pf_err = float(np.linalg.norm(
+                    pf_mean_obj - np.array([real_obj[0], real_obj[1]])))
+
                 print(
-                    f"         PF: obj_mean=({p_obj.mean(0)[0]:+.3f},{p_obj.mean(0)[1]:+.3f}) "
-                    f"n_contact={n_contact}/{config.N} "
+                    f"         PF: obj_mean=({pf_mean_obj[0]:+.3f},{pf_mean_obj[1]:+.3f}) "
+                    f"err={pf_err:.3f}m  "
+                    f"std=({obj_std_x:.3f},{obj_std_y:.3f})  "
+                    f"n_contact={n_contact}/{config.N}  "
+                    f"ESS={ess:.0f}  "
                     f"w_ratio={w_max/w_min if w_min>0 else float('inf'):.0f}"
                 )
             print(f"         fork_z={fork[2]:+.4f}  TABLE_Z={TABLE_Z:.4f}")
@@ -402,6 +417,8 @@ def run(config: Config, render: bool = False, record: bool = False,
           f"(GPU={avg_gpu_ms:.2f}  ENV={avg_env_ms:.2f})")
     print(f"  Deadline hits : {deadline_hits}/{n_steps} "
           f"({100*deadline_hits/max(n_steps,1):.1f}%  <= {config.deadline_ms:.0f} ms)")
+    print(f"  PF resamples  : {resample_count} / {n_steps} steps "
+          f"({'N/A — --no-pf' if no_pf else f'{100*resample_count/max(n_steps,1):.1f}%'})")
     print(f"{'='*60}")
 
     # ---- Save timing log ---------------------------------------------------
