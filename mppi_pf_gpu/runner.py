@@ -164,6 +164,7 @@ def run(config: Config, render: bool = False, record: bool = False,
     target = _get_target(obs)
     dynamics.set_target(target)
     mppi.set_target(target)
+    mppi.reset()
     pf.initialize(obs)
 
     total_reward   = 0.0

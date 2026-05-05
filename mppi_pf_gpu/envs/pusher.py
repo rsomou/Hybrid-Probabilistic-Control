@@ -63,11 +63,12 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
 GOAL_WEIGHT     = 10.0    # weight on obj-to-goal distance (THE objective)
-APPROACH_WEIGHT = 5.0     # distance from fork to the "behind-object" target point.
-                           # That point sits BEHIND_DIST metres behind the object along
-                           # the push axis — it encodes both proximity *and* direction
-                           # in a single distance term, with no separate alignment weight.
-BEHIND_DIST     = 0.12    # ideal fork standoff behind object along push axis (metres)
+APPROACH_WEIGHT = 5.0     # distance from fork to a target point past the object along
+                           # the push axis.  The fork is pulled THROUGH the contact zone
+                           # into the object, which triggers contact and pushes it toward
+                           # the goal.  Encodes both proximity and direction.
+BEHIND_DIST     = -0.05   # negative = target point is 5cm PAST the object toward the goal.
+                           # Fork must pass through the object to reach it → guaranteed contact.
 TERMINAL_WEIGHT = 8.0     # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
@@ -508,9 +509,9 @@ class PusherDynamics(AnalyticalDynamics):
         # 1. Object-to-goal distance (PRIMARY objective)
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Fork to "behind-object" target: BEHIND_DIST metres behind the
-        #    object along the push axis.  Encodes both proximity and direction
-        #    in a single distance — no separate alignment weight needed.
+        # 2. Fork to target point past the object along the push axis.
+        #    BEHIND_DIST < 0 places target on the goal side of the object,
+        #    pulling the fork through the contact zone.
         push_dir  = (self._target_pos - obj_pos) / (obj_tgt_dist + 1e-4)
         behind_pt = obj_pos - BEHIND_DIST * push_dir
         dz = fk_z - TABLE_Z
@@ -1058,8 +1059,9 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* Ideal fork position: BEHIND_DIST behind the object along the push axis.
-       Folds approach-distance + alignment into one term. */
+    /* Target fork position: BEHIND_DIST past the object along the push axis.
+       BEHIND_DIST < 0 means the target is on the GOAL side of the object,
+       so the fork is pulled through the contact zone into the object. */
     float inv_dt = 1.0f / (d_target + 1e-4f);
     float px = (target[0] - obj_pos[0]) * inv_dt;
     float py = (target[1] - obj_pos[1]) * inv_dt;
@@ -1091,9 +1093,9 @@ __device__ float cost_pusher(const float* state, const float* action,
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* Ideal fork position: BEHIND_DIST behind the object along push axis.
-       Being on the wrong side naturally increases this distance, so
-       alignment is implicit — no separate weight needed. */
+    /* Target fork position: BEHIND_DIST past the object along push axis.
+       BEHIND_DIST < 0 places the target on the goal side of the object,
+       pulling the fork through the contact zone → guaranteed contact. */
     float inv_dt = 1.0f / (d_target + 1e-4f);
     float px = (target[0] - obj_pos[0]) * inv_dt;
     float py = (target[1] - obj_pos[1]) * inv_dt;
