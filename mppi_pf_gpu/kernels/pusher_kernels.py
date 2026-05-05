@@ -44,12 +44,6 @@ void mppi_rollout(
 
     float total_cost = 0.0f;
 
-    // prev_action is used by the smoothness term: penalises large jumps
-    // between consecutive actions.  Initialise to zeros so t=0 is free
-    // (equivalent to np.sum((u[1:] - u[:-1])**2) which has no t=0 term).
-    float prev_action[ACTION_DIM];
-    for (int a = 0; a < ACTION_DIM; a++) prev_action[a] = 0.0f;
-
     for (int t = 0; t < H; t++) {
         // Compute clipped perturbed action: u_bar[t] + eps[k, t, :]
         float action[ACTION_DIM];
@@ -59,18 +53,6 @@ void mppi_rollout(
             float u = u_bar[u_base + a] + eps[eps_base + a];
             action[a] = fminf(fmaxf(u, action_low[a]), action_high[a]);
         }
-
-        // Action smoothness penalty: sum_t ||(action[t] - action[t-1])||^2
-        // Skipped at t=0 (prev_action == 0 is a sentinel, not a real prior).
-        if (t > 0) {
-            float smooth = 0.0f;
-            for (int a = 0; a < ACTION_DIM; a++) {
-                float da = action[a] - prev_action[a];
-                smooth += da * da;
-            }
-            total_cost += SMOOTH_WEIGHT * smooth;
-        }
-        for (int a = 0; a < ACTION_DIM; a++) prev_action[a] = action[a];
 
         // Accumulate running cost before state transition
         total_cost += cost_pusher(state, action, target, t, H);
