@@ -93,6 +93,13 @@ class Config:
     enable_timing: bool = True       # toggle CUDA event timing
 
     # ------------------------------------------------------------------ #
+    # JAX JIT compilation
+    # ------------------------------------------------------------------ #
+    # Shape-determining args for jax.jit static_argnames.
+    # Changing any of these triggers recompilation; reusing them stays cached.
+    jit_static_args: tuple = ("K", "H", "N", "N_CP")
+
+    # ------------------------------------------------------------------ #
     # Future scheduler placeholders — do NOT implement logic here
     # These are stored for the adaptive scheduler to read and modify.
     # ------------------------------------------------------------------ #
