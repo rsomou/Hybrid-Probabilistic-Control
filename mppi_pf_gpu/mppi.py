@@ -89,20 +89,7 @@ class MPPI:
         self._costs    = self._costs_buf[: self._K_active]
         self._weights  = self._w_buf[: self._K_active]
 
-        # ---- Spline control-point interpolation tables (precomputed) ------
-        # Noise is sampled as (K, N_CP, action_dim) then linearly interpolated
-        # to (K, H, action_dim).  This reduces effective sample dimension from
-        # H*action_dim=350 to N_CP*action_dim=42 and guarantees the per-rollout
-        # action trace is band-limited (no intra-step sign reversals).
-        N_CP = config.N_CP
-        assert 2 <= N_CP <= self.H, "N_CP must be in [2, H]"
-        t_cp  = np.linspace(0, N_CP - 1, self.H, dtype=np.float32)  # (H,)
-        cp_lo = np.minimum(t_cp.astype(np.int32), N_CP - 2)          # floor, clamp to [0, N_CP-2]
-        cp_fr = (t_cp - cp_lo.astype(np.float32))                    # fractional part in [0, 1]
-        # Upload to GPU; shapes broadcast over (K, H, action_dim)
-        self._cp_lo   = cp.asarray(cp_lo)                   # (H,)    int32
-        self._cp_hi   = cp.asarray(cp_lo + 1)               # (H,)    int32 — safe: max = N_CP-1
-        self._cp_frac = cp.asarray(cp_fr[None, :, None])    # (1,H,1) float32
+        # No spline precomputation — per-step AR(1) noise is used directly.
 
     # ------------------------------------------------------------------ #
     # Episode-level API
@@ -170,38 +157,22 @@ class MPPI:
 
         timing = {"rollout_ms": 0.0, "weight_ms": 0.0, "update_ms": 0.0}
 
-        # 1. Sample spline control-point (CP) perturbations, then interpolate
-        #    to the full H-step action sequence.
-        #
-        #    Sampling in CP space (K, N_CP, 7) instead of (K, H, 7) reduces
-        #    effective noise dimension by ~H/N_CP ≈ 8x.  Linear interpolation
-        #    from N_CP=6 CPs to H=50 steps enforces band-limited, smooth traces
-        #    — no intra-step sign reversals.  AR(1) is then applied in CP space
-        #    for additional inter-CP smoothness.
+        # 1. Sample temporally-correlated perturbations on GPU.
+        #    eps[t] = beta * eps[t-1] + sqrt(1-beta^2) * white[t]
+        #    Per-step AR(1) gives smooth trajectories while preserving
+        #    full H-step resolution for fine-grained maneuvering.
         beta = self.config.noise_beta
-        N_CP = self.config.N_CP
-
-        white_cp = cp.random.normal(
-            0.0, 1.0, (K, N_CP, action_dim), dtype=cp.float32,
-        ) * self.sigma_vec  # (K, N_CP, action_dim)
-
-        # AR(1) in CP space
-        if beta > 0 and N_CP > 1:
+        white = cp.random.normal(
+            0.0, 1.0, (K, H, action_dim), dtype=cp.float32,
+        ) * self.sigma_vec  # (K, H, action_dim)
+        if beta > 0:
             scale = float(np.sqrt(1.0 - beta * beta))
-            cp_eps = cp.empty((K, N_CP, action_dim), dtype=cp.float32)
-            cp_eps[:, 0, :] = white_cp[:, 0, :]
-            for t in range(1, N_CP):
-                cp_eps[:, t, :] = (beta * cp_eps[:, t - 1, :]
-                                   + scale * white_cp[:, t, :])
+            self._eps[:K, 0, :] = white[:, 0, :]
+            for t in range(1, H):
+                self._eps[:K, t, :] = (beta * self._eps[:K, t-1, :]
+                                       + scale * white[:, t, :])
         else:
-            cp_eps = white_cp
-
-        # Linear interpolation: (K, N_CP, action_dim) → (K, H, action_dim)
-        # _cp_lo / _cp_hi are precomputed integer index arrays of shape (H,);
-        # _cp_frac has shape (1, H, 1) for broadcasting over (K, H, action_dim).
-        lo = cp_eps[:, self._cp_lo, :]   # (K, H, action_dim)
-        hi = cp_eps[:, self._cp_hi, :]   # (K, H, action_dim)
-        self._eps[:K] = lo + self._cp_frac * (hi - lo)
+            self._eps[:K] = white
 
         # 2. Rollout kernel — K threads, each rolls out H steps
         grid_k, block = self.gpu.get_grid_block(K)

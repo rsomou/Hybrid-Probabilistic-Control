@@ -514,9 +514,8 @@ class PusherDynamics(AnalyticalDynamics):
         #    pulling the fork through the contact zone.
         push_dir  = (self._target_pos - obj_pos) / (obj_tgt_dist + 1e-4)
         behind_pt = obj_pos - BEHIND_DIST * push_dir
-        dz = fk_z - TABLE_Z
         d_fork_target = np.sqrt((fk_x - behind_pt[0])**2
-                                + (fk_y - behind_pt[1])**2 + dz**2)
+                                + (fk_y - behind_pt[1])**2)  # XY only
 
         return GOAL_WEIGHT * obj_tgt_dist + APPROACH_WEIGHT * d_fork_target
 
@@ -1069,8 +1068,7 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float by = obj_pos[1] - BEHIND_DIST * py;
     float ddx = fk_x - bx;
     float ddy = fk_y - by;
-    float ddz = fk_z - TABLE_Z;
-    float d_fork_target = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
+    float d_fork_target = sqrtf(ddx*ddx + ddy*ddy);   /* XY only — z gap is unreachable */
 
     return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_target);
 }
@@ -1103,8 +1101,7 @@ __device__ float cost_pusher(const float* state, const float* action,
     float by = obj_pos[1] - BEHIND_DIST * py;
     float dx = fk_x - bx;
     float dy = fk_y - by;
-    float dz = fk_z - TABLE_Z;
-    float d_fork_target = sqrtf(dx*dx + dy*dy + dz*dz);
+    float d_fork_target = sqrtf(dx*dx + dy*dy);   /* XY only — z gap is unreachable */
 
     return GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_target;
 }
