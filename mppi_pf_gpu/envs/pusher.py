@@ -61,14 +61,17 @@ FRAME_SKIP     = 5          # number of inner integration substeps per control s
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
 # --- Cost function weights ---
-# obj→goal is the PRIMARY signal; fork→obj is a lightweight guide.
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
 GOAL_WEIGHT        = 10.0    # weight on obj-to-goal distance (THE objective)
-APPROACH_WEIGHT    = 2.0     # lightweight guide: fork-to-object 3D distance
-ACTION_COST_WEIGHT      = 0.05   # weight on ||action||^2 — increased to penalise large actions
-SMOOTH_WEIGHT          = 0.01   # weight on ||action[t] - action[t-1]||^2 summed over t=1..H-1
-                                 # discourages bang-bang trajectories; paired with spline CP sampling
-TERMINAL_WEIGHT        = 8.0    # multiplier on the terminal-state cost (applied once at step H)
+APPROACH_WEIGHT    = 4.0     # fork-to-object 3D distance — DECOUPLED from d_target so the
+                              # planner has a constant gradient toward the object throughout
+                              # the approach phase, not just when the object is near the goal
+ALIGN_WEIGHT       = 2.0     # approach direction: fork should be behind the object along the
+                              # push axis (goal-opposite side).  Penalises fork on the wrong
+                              # side that would push object away.  Scales with d_target.
+ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2
+SMOOTH_WEIGHT      = 0.01    # weight on ||action[t] - action[t-1]||^2 summed over t=1..H-1
+TERMINAL_WEIGHT    = 8.0     # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -506,18 +509,27 @@ class PusherDynamics(AnalyticalDynamics):
         # 1. Object-to-goal distance (PRIMARY objective)
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Fork-to-object 3D distance (lightweight approach guide)
+        # 2. Fork-to-object 3D distance (approach guide, always active)
         dz = fk_z - TABLE_Z
         d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2 + (fk_y - obj_pos[1])**2 + dz**2)
 
-        # 3. Action regularisation
+        # 3. Approach alignment: fork should be behind object along push direction.
+        # push_dir = unit(goal - obj),  fo_unit = unit(obj - fork) in XY.
+        # alignment: +1 = fork directly behind object, -1 = fork on goal side.
+        push_dir = (self._target_pos - obj_pos) / (obj_tgt_dist + 1e-4)
+        fo_xy    = obj_pos - np.array([fk_x, fk_y])
+        fo_unit  = fo_xy / (np.linalg.norm(fo_xy) + 1e-4)
+        alignment = float(np.dot(fo_unit, push_dir))
+
+        # 4. Action regularisation
         action_cost = float(np.dot(action, action))
 
-        # Multiply secondary terms by obj_tgt_dist so that cost → 0
-        # exactly when the object is on the goal.
+        # Approach is decoupled from obj_tgt_dist so the planner always has
+        # a strong gradient toward the object in the approach phase.
         return (GOAL_WEIGHT          * obj_tgt_dist
-                + APPROACH_WEIGHT    * d_fork_obj   * obj_tgt_dist
-                + ACTION_COST_WEIGHT * action_cost  * obj_tgt_dist)
+                + APPROACH_WEIGHT    * d_fork_obj
+                + ALIGN_WEIGHT       * (1.0 - alignment) * obj_tgt_dist
+                + ACTION_COST_WEIGHT * action_cost * obj_tgt_dist)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -693,6 +705,7 @@ def _generate_cuda_code():
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
         f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
+        f"#define ALIGN_WEIGHT {ALIGN_WEIGHT:.6f}f\n"
         f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
         f"#define SMOOTH_WEIGHT {SMOOTH_WEIGHT:.6f}f\n"
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
@@ -1063,7 +1076,19 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float ddz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj);
+    /* Approach alignment: fork behind object along push direction.     */
+    /* push_dir = unit(goal - obj),  fo_unit = unit(obj - fork) in XY. */
+    float inv_dt  = 1.0f / (d_target + 1e-4f);
+    float push_x  = (target[0] - obj_pos[0]) * inv_dt;
+    float push_y  = (target[1] - obj_pos[1]) * inv_dt;
+    float inv_dxy = 1.0f / (sqrtf(ddx*ddx + ddy*ddy) + 1e-4f);
+    float fo_x    = -ddx * inv_dxy;   /* unit vec: fork → obj (XY only) */
+    float fo_y    = -ddy * inv_dxy;
+    float alignment = fo_x * push_x + fo_y * push_y; /* +1=ideal, -1=wrong side */
+
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT     * d_target
+                            + APPROACH_WEIGHT * d_fork_obj
+                            + ALIGN_WEIGHT    * (1.0f - alignment) * d_target);
 }
 
 /* ================================================================== */
@@ -1088,22 +1113,37 @@ __device__ float cost_pusher(const float* state, const float* action,
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* ---- 2. Fork-to-object 3D distance (lightweight guide) ---- */
+    /* ---- 2. Fork-to-object 3D distance (approach guide, always active) ---- */
     float dx = fk_x - obj_pos[0];
     float dy = fk_y - obj_pos[1];
     float dz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    /* ---- 3. Action regularisation ---- */
+    /* ---- 3. Approach alignment: fork should be behind object ----------- */
+    /* push_dir = unit(goal - obj),  fo_unit = unit(obj - fork) in XY.    */
+    /* alignment +1 = fork directly behind object (ideal push position).  */
+    /* alignment -1 = fork on goal side (would push object away).         */
+    float inv_dt = 1.0f / (d_target + 1e-4f);
+    float push_x = (target[0] - obj_pos[0]) * inv_dt;
+    float push_y = (target[1] - obj_pos[1]) * inv_dt;
+    float d_xy   = sqrtf(dx*dx + dy*dy + 1e-8f);
+    float fo_x   = -dx / d_xy;   /* unit vec: fork → obj (XY plane) */
+    float fo_y   = -dy / d_xy;
+    float alignment = fo_x * push_x + fo_y * push_y;
+
+    /* ---- 4. Action regularisation ---- */
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
-    /* Multiply secondary terms by d_target so cost == 0 when object
-       is exactly on the goal.  Approach and action penalties vanish
-       once d_target == 0, giving cost == 0 at the target. */
+    /* Approach is DECOUPLED from d_target: the planner always has a strong
+       gradient toward the object regardless of how far away the goal is.
+       Alignment and action terms still scale with d_target so they vanish
+       once the task is complete.  This combination gives ~27% approach signal
+       vs ~4% with the old d_fork_obj*d_target formulation. */
     return GOAL_WEIGHT        * d_target
-         + APPROACH_WEIGHT    * d_fork_obj * d_target
-         + ACTION_COST_WEIGHT * act2        * d_target;
+         + APPROACH_WEIGHT    * d_fork_obj
+         + ALIGN_WEIGHT       * (1.0f - alignment) * d_target
+         + ACTION_COST_WEIGHT * act2 * d_target;
 }
 """
 
