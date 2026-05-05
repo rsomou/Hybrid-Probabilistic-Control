@@ -190,7 +190,7 @@ def main(
     sigma: float = 1.0,
     lambda_: float = 1.0,
     steps: int = 300,
-    record: bool = False,
+    record: bool = True,
     no_pf: bool = False,
     no_timing: bool = False,
     smoke: bool = False,
