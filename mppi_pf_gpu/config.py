@@ -39,20 +39,22 @@ class Config:
     lambda_: float = 0.5             # temperature — lower = sharper selection of best trajectories
     sigma: float = 0.5               # global perturbation scale — reduced from 0.8 to keep
                                      # rollout noise tighter around the nominal trajectory
-    noise_beta: float = 0.8          # temporal correlation for perturbation noise.
-                                     # eps[t] = beta*eps[t-1] + sqrt(1-beta^2)*white[t]
-                                     # 0 = i.i.d. (jittery), 1 = constant (no variation)
-                                     # 0.8 = smoother rollouts, less high-frequency jitter
+    noise_beta: float = 0.8          # temporal correlation for AR(1) applied in control-point space.
+                                     # eps_cp[t] = beta*eps_cp[t-1] + sqrt(1-beta^2)*white[t]
+                                     # The spline interpolation then smooths CPs → H steps automatically.
     action_alpha: float = 0.5        # EMA smoothing on output action.
                                      # a_out = alpha*a_prev + (1-alpha)*a_mppi
                                      # 0 = no smoothing, 1 = frozen
                                      # 0.5 = equal blend, halves step-to-step variation
+    N_CP: int = 6                    # number of spline control points per rollout trajectory.
+                                     # Noise is sampled as (K, N_CP, 7) then linearly interpolated
+                                     # to (K, H, 7) before rollout — reduces effective sample
+                                     # dimension from H*7=350 to N_CP*7=42 and guarantees smooth
+                                     # action sequences without relying on AR(1) alone.
     # Per-joint sigma multipliers for Pusher-v5 (7 joints):
     #   0=shoulder_pan, 1=shoulder_lift, 2=upper_arm_roll,
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll
-    # wrist_roll (6) is reduced to 0.1 — it rotates the tines but has no
-    # effect on fork_xy/fork_z, so wide exploration there is wasteful.
-    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.1)
+    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.5)
 
     elite_frac: float = 0.3          # fraction of lowest-cost rollouts used for u_bar update.
                                      # Weights for the other (1-elite_frac)*K trajectories are

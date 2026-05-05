@@ -66,8 +66,8 @@ TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF bo
 GOAL_WEIGHT        = 10.0    # weight on obj-to-goal distance (THE objective)
 APPROACH_WEIGHT    = 2.0     # lightweight guide: fork-to-object 3D distance
 ACTION_COST_WEIGHT      = 0.05   # weight on ||action||^2 — increased to penalise large actions
-WRIST_ROLL_ACT_WEIGHT  = 0.5    # extra penalty on action[6]^2 (wrist_roll has zero effect on
-                                 # fork position, so without this it is effectively a free joint)
+SMOOTH_WEIGHT          = 0.01   # weight on ||action[t] - action[t-1]||^2 summed over t=1..H-1
+                                 # discourages bang-bang trajectories; paired with spline CP sampling
 TERMINAL_WEIGHT        = 8.0    # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
@@ -512,14 +512,12 @@ class PusherDynamics(AnalyticalDynamics):
 
         # 3. Action regularisation
         action_cost = float(np.dot(action, action))
-        wr2 = float(action[6] ** 2)  # extra wrist_roll penalty (see CUDA cost_pusher)
 
         # Multiply secondary terms by obj_tgt_dist so that cost → 0
         # exactly when the object is on the goal.
-        return (GOAL_WEIGHT             * obj_tgt_dist
-                + APPROACH_WEIGHT       * d_fork_obj   * obj_tgt_dist
-                + ACTION_COST_WEIGHT    * action_cost  * obj_tgt_dist
-                + WRIST_ROLL_ACT_WEIGHT * wr2          * obj_tgt_dist)
+        return (GOAL_WEIGHT          * obj_tgt_dist
+                + APPROACH_WEIGHT    * d_fork_obj   * obj_tgt_dist
+                + ACTION_COST_WEIGHT * action_cost  * obj_tgt_dist)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -696,7 +694,7 @@ def _generate_cuda_code():
         f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
         f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
-        f"#define WRIST_ROLL_ACT_WEIGHT {WRIST_ROLL_ACT_WEIGHT:.6f}f\n"
+        f"#define SMOOTH_WEIGHT {SMOOTH_WEIGHT:.6f}f\n"
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
@@ -1100,19 +1098,12 @@ __device__ float cost_pusher(const float* state, const float* action,
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
-    /* Extra wrist_roll penalty: action[6] rotates the fork tines but
-       has zero effect on the fork body position (wrist_flex→wrist_roll
-       offset is [0,0,0] in FK), so without this extra term the planner
-       treats wrist_roll as a free variable and spins it without cost. */
-    float wr2 = action[6] * action[6];
-
     /* Multiply secondary terms by d_target so cost == 0 when object
        is exactly on the goal.  Approach and action penalties vanish
        once d_target == 0, giving cost == 0 at the target. */
-    return GOAL_WEIGHT           * d_target
-         + APPROACH_WEIGHT       * d_fork_obj * d_target
-         + ACTION_COST_WEIGHT    * act2        * d_target
-         + WRIST_ROLL_ACT_WEIGHT * wr2         * d_target;
+    return GOAL_WEIGHT        * d_target
+         + APPROACH_WEIGHT    * d_fork_obj * d_target
+         + ACTION_COST_WEIGHT * act2        * d_target;
 }
 """
 
