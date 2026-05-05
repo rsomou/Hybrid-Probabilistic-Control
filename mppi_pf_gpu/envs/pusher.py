@@ -66,6 +66,8 @@ TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body 
 GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared so gradient doesn't vanish
 APPROACH_WEIGHT = 15.0    # weight on d(fork, obj) in 3D — pulls arm deeper into contact range
 TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
+JLIMIT_WEIGHT   = 0.5     # soft joint-limit avoidance — steers rollouts away from saturated joints
+JLIMIT_MARGIN   = 10.0    # barrier sharpness (1/rad) — higher = steeper penalty near limits
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -510,7 +512,13 @@ class PusherDynamics(AnalyticalDynamics):
         d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
                              + (fk_y - obj_pos[1])**2 + dz**2)
 
-        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj
+        # 3. Soft joint-limit barrier
+        q = state[0:7]
+        lo = q - JOINT_Q_MIN
+        hi = JOINT_Q_MAX - q
+        jlim = float(np.sum(np.exp(-JLIMIT_MARGIN * lo) + np.exp(-JLIMIT_MARGIN * hi)))
+
+        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj + JLIMIT_WEIGHT * jlim
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -687,7 +695,9 @@ def _generate_cuda_code():
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
         f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
-        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
+        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
+        f"#define JLIMIT_WEIGHT {JLIMIT_WEIGHT:.6f}f\n"
+        f"#define JLIMIT_MARGIN {JLIMIT_MARGIN:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1058,17 +1068,28 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float ddz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj);
+    /* Soft joint-limit barrier */
+    float jlim = 0.0f;
+    for (int j = 0; j < NUM_JOINTS; j++) {
+        float lo = state[j] - JOINT_Q_MIN_D[j];
+        float hi = JOINT_Q_MAX_D[j] - state[j];
+        jlim += expf(-JLIMIT_MARGIN * lo) + expf(-JLIMIT_MARGIN * hi);
+    }
+
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj
+           + JLIMIT_WEIGHT * jlim);
 }
 
 /* ================================================================== */
-/*  cost_pusher: two-term running cost                                  */
+/*  cost_pusher: three-term running cost                                */
 /*  1. d(obj, goal)^2 in 2D     (GOAL_WEIGHT)     — PRIMARY            */
 /*  2. d(fork, obj) in 3D       (APPROACH_WEIGHT)  — approach guide     */
+/*  3. soft joint-limit barrier  (JLIMIT_WEIGHT)   — avoid saturation   */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
 {
+    const float* q = state;
     const float* obj_pos = state + 14;
 
     float fk_x = state[18];
@@ -1086,7 +1107,16 @@ __device__ float cost_pusher(const float* state, const float* action,
     float dz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj;
+    /* Soft joint-limit barrier: sum of exp penalties near each limit */
+    float jlim = 0.0f;
+    for (int j = 0; j < NUM_JOINTS; j++) {
+        float lo = q[j] - JOINT_Q_MIN_D[j];   /* distance from lower limit */
+        float hi = JOINT_Q_MAX_D[j] - q[j];   /* distance from upper limit */
+        jlim += expf(-JLIMIT_MARGIN * lo) + expf(-JLIMIT_MARGIN * hi);
+    }
+
+    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj
+           + JLIMIT_WEIGHT * jlim;
 }
 """
 
