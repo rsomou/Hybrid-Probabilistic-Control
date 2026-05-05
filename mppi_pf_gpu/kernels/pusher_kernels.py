@@ -61,6 +61,11 @@ void mppi_rollout(
         f_pusher(state, action, dt);
     }
 
+    // Terminal cost: evaluated on the final state after H transitions.
+    // Applied once — weighted by TERMINAL_WEIGHT so it dominates the
+    // running sum and forces the planner to end trajectories near the goal.
+    total_cost += terminal_cost_pusher(state, target);
+
     costs[k] = total_cost;
 }
 """

@@ -204,6 +204,20 @@ class MPPI:
                 np.int32(K),
             ),
         )
+
+        # Elite filtering: zero out weights for the worst (1-elite_frac)*K
+        # trajectories before normalisation.  Only the top elite_frac*K
+        # lowest-cost rollouts contribute to u_bar — sharpens the update
+        # signal and prevents bad rollouts from polluting the nominal plan.
+        if self.config.elite_frac < 1.0:
+            elite_k = max(1, int(K * self.config.elite_frac))
+            # argsort costs ascending; mask everything outside the elite set
+            sorted_idx   = cp.argsort(self._costs)          # indices low→high cost
+            elite_idx    = sorted_idx[:elite_k]             # best elite_k
+            mask         = cp.zeros(K, dtype=cp.float32)
+            mask[elite_idx] = 1.0
+            self._weights *= mask
+
         self.gpu.parallel_normalize(self._weights)
 
         # 4. Weighted accumulation of ε → u_bar delta

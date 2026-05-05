@@ -66,6 +66,7 @@ TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF bo
 GOAL_WEIGHT        = 10.0    # weight on obj-to-goal distance (THE objective)
 APPROACH_WEIGHT    = 2.0     # lightweight guide: fork-to-object 3D distance
 ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2 — increased to penalise large actions
+TERMINAL_WEIGHT    = 8.0     # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -690,7 +691,8 @@ def _generate_cuda_code():
         f"#define TABLE_Z         {TABLE_Z:.6f}f\n"
         f"#define GOAL_WEIGHT {GOAL_WEIGHT:.6f}f\n"
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
-        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n\n"
+        f"#define ACTION_COST_WEIGHT {ACTION_COST_WEIGHT:.6f}f\n"
+        f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1032,6 +1034,33 @@ __device__ void f_pusher(float* state, const float* action, float dt)
         /* Update fork xy + z from FK */
         forward_kinematics(q, &fork_xy[0], &fork_xy[1], fork_z);
     }
+}
+
+/* ================================================================== */
+/*  terminal_cost_pusher: one-time cost on the final rollout state     */
+/*                                                                      */
+/*  Applied ONCE after step H (not per-step).  Scaled by               */
+/*  TERMINAL_WEIGHT so it dominates the running-cost sum and forces    */
+/*  the planner to care where the trajectory *ends*, not just its      */
+/*  average.  No d_target vanishing here — both terms are pure.        */
+/* ================================================================== */
+__device__ float terminal_cost_pusher(const float* state, const float* target)
+{
+    const float* obj_pos = state + 14;
+
+    float dx = obj_pos[0] - target[0];
+    float dy = obj_pos[1] - target[1];
+    float d_target = sqrtf(dx*dx + dy*dy);
+
+    float fk_x = state[18];
+    float fk_y = state[19];
+    float fk_z = state[20];
+    float ddx = fk_x - obj_pos[0];
+    float ddy = fk_y - obj_pos[1];
+    float ddz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
+
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj);
 }
 
 /* ================================================================== */

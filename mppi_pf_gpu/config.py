@@ -52,6 +52,11 @@ class Config:
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll
     sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.5)
 
+    elite_frac: float = 0.3          # fraction of lowest-cost rollouts used for u_bar update.
+                                     # Weights for the other (1-elite_frac)*K trajectories are
+                                     # zeroed before normalisation.  0.3 = top 30% only.
+                                     # 1.0 = standard MPPI (all K used).
+
     # ------------------------------------------------------------------ #
     # Observation Delay
     # ------------------------------------------------------------------ #
