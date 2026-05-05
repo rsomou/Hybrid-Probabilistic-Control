@@ -50,7 +50,9 @@ class Config:
     # Per-joint sigma multipliers for Pusher-v5 (7 joints):
     #   0=shoulder_pan, 1=shoulder_lift, 2=upper_arm_roll,
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll
-    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.5)
+    # wrist_roll (6) is reduced to 0.1 — it rotates the tines but has no
+    # effect on fork_xy/fork_z, so wide exploration there is wasteful.
+    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.1)
 
     elite_frac: float = 0.3          # fraction of lowest-cost rollouts used for u_bar update.
                                      # Weights for the other (1-elite_frac)*K trajectories are
