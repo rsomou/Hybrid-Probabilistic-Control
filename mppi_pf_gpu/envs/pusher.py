@@ -63,9 +63,12 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
-GOAL_WEIGHT     = 10.0    # weight on d(obj, goal) — THE objective
-APPROACH_WEIGHT = 5.0     # weight on d(fork, obj) in 3D — drives arm toward the object
-TERMINAL_WEIGHT = 8.0     # multiplier on the terminal-state cost (applied once at step H)
+GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared distance so gradient stays
+                           # strong near the goal.  At d=0.3m: 100*0.09=9/step.
+                           # At d=0.1m: 100*0.01=1/step.  Linear d had only 1.4/step
+                           # at d=0.14m which was below the cost noise floor.
+APPROACH_WEIGHT = 5.0     # weight on d(fork, obj) in 3D — linear, drives arm toward object
+TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -502,7 +505,7 @@ class PusherDynamics(AnalyticalDynamics):
         obj_pos = state[14:16]
         fk_x, fk_y, fk_z = state[18], state[19], state[20]
 
-        # 1. Object-to-goal distance (PRIMARY objective)
+        # 1. Object-to-goal SQUARED distance (stronger gradient near goal)
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
         # 2. Fork-to-object 3D distance (includes z — forces arm to descend)
@@ -510,7 +513,7 @@ class PusherDynamics(AnalyticalDynamics):
         d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
                              + (fk_y - obj_pos[1])**2 + dz**2)
 
-        return GOAL_WEIGHT * obj_tgt_dist + APPROACH_WEIGHT * d_fork_obj
+        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -1056,7 +1059,7 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float ddz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj);
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj);
 }
 
 /* ================================================================== */
@@ -1084,7 +1087,7 @@ __device__ float cost_pusher(const float* state, const float* action,
     float dz = fk_z - TABLE_Z;
     float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    return GOAL_WEIGHT * d_target + APPROACH_WEIGHT * d_fork_obj;
+    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj;
 }
 """
 

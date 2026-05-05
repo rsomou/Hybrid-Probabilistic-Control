@@ -38,9 +38,9 @@ class Config:
                                      # Shorter = less model-reality divergence during contact.
                                      # The analytical contact model disagrees with MuJoCo's
                                      # constraint solver, so long rollouts accumulate error.
-    lambda_: float = 80.0            # temperature — scaled proportionally to H.
-                                     # H=20, per-step cost ~4-8, total ~80-160.
-                                     # λ=80 gives exp(-80/80)=0.37, w_eff ≈ 500-1000.
+    lambda_: float = 200.0           # temperature — scaled to d² cost magnitude.
+                                     # With GOAL_WEIGHT=100 and d²: total costs ~200-500.
+                                     # λ=200 gives exp(-300/200)=0.22, w_eff ≈ 300-800.
     sigma: float = 0.8               # global perturbation scale — wider exploration to find
                                      # contact configurations after bouncing off the object.
     noise_beta: float = 0.5          # AR(1) temporal correlation — lower = faster recovery.
