@@ -55,19 +55,19 @@ from dynamics import AnalyticalDynamics
 # --------------------------------------------------------------------------- #
 NUM_JOINTS     = 7
 CONTACT_RADIUS = 0.20       # metres — enlarged to match MuJoCo stiffened geom margins
-PUSH_STRENGTH  = 50.0       # N / (m/s) — increased to better match MuJoCo's near-rigid
-                             # constraint contact with 0.5kg object + damping=2.0
-FRICTION       = 0.5        # object slide-joint damping coefficient (matches MuJoCo damping="0.5")
+PUSH_STRENGTH  = 50.0       # N / (m/s) — contact force magnitude
+OBJ_MASS       = 0.5        # kg — must match runner.py model.body_mass[obj_body_id]
+FRICTION       = 2.0        # object slide-joint damping — must match runner.py dof_damping=2.0
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
 
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
-GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared distance so gradient stays
-                           # strong near the goal.  At d=0.3m: 100*0.09=9/step.
-                           # At d=0.1m: 100*0.01=1/step.  Linear d had only 1.4/step
-                           # at d=0.14m which was below the cost noise floor.
-APPROACH_WEIGHT = 5.0     # weight on d(fork, obj) in 3D — linear, drives arm toward object
+GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared so gradient doesn't vanish
+APPROACH_WEIGHT = 5.0     # weight on d(fork, goal) in XY — pulls fork toward the GOAL,
+                           # not the object.  The fork must push through the object to
+                           # get closer to the goal.  This prevents the stall where the
+                           # fork parks next to the object at 0.08m and stops pushing.
 TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
@@ -444,7 +444,7 @@ class PusherDynamics(AnalyticalDynamics):
                     v_component = max(0.0, float(tip_vel @ push_dir))
                     push_force  = PUSH_STRENGTH * v_component
 
-                    obj_vel += push_force * push_dir * dt_sub
+                    obj_vel += (push_force / OBJ_MASS) * push_dir * dt_sub
 
                     # Newton's 3rd law: reaction on arm as joint torque via J^T
                     rx = -push_force * push_dir[0]
@@ -505,15 +505,14 @@ class PusherDynamics(AnalyticalDynamics):
         obj_pos = state[14:16]
         fk_x, fk_y, fk_z = state[18], state[19], state[20]
 
-        # 1. Object-to-goal SQUARED distance (stronger gradient near goal)
+        # 1. Object-to-goal SQUARED distance
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Fork-to-object 3D distance (includes z — forces arm to descend)
-        dz = fk_z - TABLE_Z
-        d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
-                             + (fk_y - obj_pos[1])**2 + dz**2)
+        # 2. Fork-to-goal XY distance (pulls fork toward goal through object)
+        d_fork_goal = np.sqrt((fk_x - self._target_pos[0])**2
+                              + (fk_y - self._target_pos[1])**2)
 
-        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj
+        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_goal
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -681,7 +680,8 @@ def _generate_cuda_code():
         "#define OBS_DIM         16\n"
         f"#define CONTACT_RADIUS  {CONTACT_RADIUS:.2f}f\n"
         f"#define PUSH_STRENGTH   {PUSH_STRENGTH:.1f}f\n"
-        "#define FRICTION        0.5f\n"
+        f"#define OBJ_MASS        {OBJ_MASS:.2f}f\n"
+        f"#define FRICTION        {FRICTION:.1f}f\n"
         "#define ACTION_BOUND    2.0f\n"
         "#define N_SUBSTEPS      5\n"
         "#define INNER_DT        0.01f\n"
@@ -986,8 +986,9 @@ __device__ void f_pusher(float* state, const float* action, float dt)
                 float pdx=dx*id, pdy=dy*id;
                 float vc = fmaxf(tvx*pdx+tvy*pdy, 0.0f);
                 float pf = PUSH_STRENGTH*vc;
-                obj_vel[0] += pf*pdx*INNER_DT;
-                obj_vel[1] += pf*pdy*INNER_DT;
+                float accel = pf / OBJ_MASS;   /* F/m — matches runner.py mass=0.5 */
+                obj_vel[0] += accel*pdx*INNER_DT;
+                obj_vel[1] += accel*pdy*INNER_DT;
                 float rx=-pf*pdx, ry=-pf*pdy;
                 for (int j=0;j<NUM_JOINTS;j++)
                     tau_t[j] += Jx[j]*rx + Jy[j]*ry;
@@ -1053,19 +1054,18 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* Fork-to-object 3D distance */
-    float ddx = fk_x - obj_pos[0];
-    float ddy = fk_y - obj_pos[1];
-    float ddz = fk_z - TABLE_Z;
-    float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
+    /* Fork-to-goal XY distance — pulls fork toward goal THROUGH the object */
+    float dgx = fk_x - target[0];
+    float dgy = fk_y - target[1];
+    float d_fork_goal = sqrtf(dgx*dgx + dgy*dgy);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj);
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_goal);
 }
 
 /* ================================================================== */
 /*  cost_pusher: two-term running cost                                  */
-/*  1. d(obj, goal) in 2D       (GOAL_WEIGHT)     — PRIMARY            */
-/*  2. d(fork, obj) in 3D       (APPROACH_WEIGHT)  — approach guide     */
+/*  1. d(obj, goal)^2 in 2D     (GOAL_WEIGHT)     — PRIMARY            */
+/*  2. d(fork, goal) in XY      (APPROACH_WEIGHT)  — pulls fork to goal */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
@@ -1074,20 +1074,18 @@ __device__ float cost_pusher(const float* state, const float* action,
 
     float fk_x = state[18];
     float fk_y = state[19];
-    float fk_z = state[20];
 
-    /* Object-to-goal 2D */
+    /* Object-to-goal 2D squared */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* Fork-to-object 3D (includes z — forces arm to descend toward table) */
-    float dx = fk_x - obj_pos[0];
-    float dy = fk_y - obj_pos[1];
-    float dz = fk_z - TABLE_Z;
-    float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
+    /* Fork-to-goal XY — pulls fork toward goal THROUGH the object */
+    float dgx = fk_x - target[0];
+    float dgy = fk_y - target[1];
+    float d_fork_goal = sqrtf(dgx*dgx + dgy*dgy);
 
-    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj;
+    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_goal;
 }
 """
 
