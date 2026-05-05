@@ -34,16 +34,19 @@ class Config:
     # MPPI
     # ------------------------------------------------------------------ #
     K: int = 1024                    # number of trajectory samples
-    H: int = 30                      # planning horizon
+    H: int = 50                      # planning horizon — longer = sees full approach+push sequence
+                                     # (dt=0.05 * H=50 = 2.5s look-ahead)
     lambda_: float = 0.5             # temperature — lower = sharper selection of best trajectories
-    sigma: float = 0.8               # global perturbation scale (multiplied by per-joint weights)
-    noise_beta: float = 0.6          # temporal correlation for perturbation noise.
+    sigma: float = 0.5               # global perturbation scale — reduced from 0.8 to keep
+                                     # rollout noise tighter around the nominal trajectory
+    noise_beta: float = 0.8          # temporal correlation for perturbation noise.
                                      # eps[t] = beta*eps[t-1] + sqrt(1-beta^2)*white[t]
                                      # 0 = i.i.d. (jittery), 1 = constant (no variation)
-                                     # 0.6 = smooth but still exploratory
-    action_alpha: float = 0.3        # EMA smoothing on output action.
+                                     # 0.8 = smoother rollouts, less high-frequency jitter
+    action_alpha: float = 0.5        # EMA smoothing on output action.
                                      # a_out = alpha*a_prev + (1-alpha)*a_mppi
                                      # 0 = no smoothing, 1 = frozen
+                                     # 0.5 = equal blend, halves step-to-step variation
     # Per-joint sigma multipliers for Pusher-v5 (7 joints):
     #   0=shoulder_pan, 1=shoulder_lift, 2=upper_arm_roll,
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll

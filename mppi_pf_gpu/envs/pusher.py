@@ -65,7 +65,7 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 TABLE_Z            = -0.275  # z-height of the object on the table (from MJCF body pos)
 GOAL_WEIGHT        = 10.0    # weight on obj-to-goal distance (THE objective)
 APPROACH_WEIGHT    = 2.0     # lightweight guide: fork-to-object 3D distance
-ACTION_COST_WEIGHT = 0.01    # weight on ||action||^2
+ACTION_COST_WEIGHT = 0.05    # weight on ||action||^2 — increased to penalise large actions
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -510,9 +510,11 @@ class PusherDynamics(AnalyticalDynamics):
         # 3. Action regularisation
         action_cost = float(np.dot(action, action))
 
+        # Multiply secondary terms by obj_tgt_dist so that cost → 0
+        # exactly when the object is on the goal.
         return (GOAL_WEIGHT        * obj_tgt_dist
-                + APPROACH_WEIGHT   * d_fork_obj
-                + ACTION_COST_WEIGHT * action_cost)
+                + APPROACH_WEIGHT   * d_fork_obj    * obj_tgt_dist
+                + ACTION_COST_WEIGHT * action_cost  * obj_tgt_dist)
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -1064,9 +1066,12 @@ __device__ float cost_pusher(const float* state, const float* action,
     float act2 = 0.0f;
     for (int a = 0; a < ACTION_DIM; a++) act2 += action[a]*action[a];
 
-    return GOAL_WEIGHT      * d_target
-         + APPROACH_WEIGHT  * d_fork_obj
-         + ACTION_COST_WEIGHT * act2;
+    /* Multiply secondary terms by d_target so cost == 0 when object
+       is exactly on the goal.  Approach and action penalties vanish
+       once d_target == 0, giving cost == 0 at the target. */
+    return GOAL_WEIGHT        * d_target
+         + APPROACH_WEIGHT    * d_fork_obj   * d_target
+         + ACTION_COST_WEIGHT * act2         * d_target;
 }
 """
 
