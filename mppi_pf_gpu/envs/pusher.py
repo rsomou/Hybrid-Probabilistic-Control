@@ -64,10 +64,7 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
 GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared so gradient doesn't vanish
-APPROACH_WEIGHT = 5.0     # weight on d(fork, goal) in XY — pulls fork toward the GOAL,
-                           # not the object.  The fork must push through the object to
-                           # get closer to the goal.  This prevents the stall where the
-                           # fork parks next to the object at 0.08m and stops pushing.
+APPROACH_WEIGHT = 5.0     # weight on d(fork, obj) in 3D — pulls arm toward the object
 TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
@@ -508,11 +505,12 @@ class PusherDynamics(AnalyticalDynamics):
         # 1. Object-to-goal SQUARED distance
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. Fork-to-goal XY distance (pulls fork toward goal through object)
-        d_fork_goal = np.sqrt((fk_x - self._target_pos[0])**2
-                              + (fk_y - self._target_pos[1])**2)
+        # 2. Fork-to-object 3D distance (includes z — forces arm to descend)
+        dz = fk_z - TABLE_Z
+        d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
+                             + (fk_y - obj_pos[1])**2 + dz**2)
 
-        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_goal
+        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -1054,18 +1052,19 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* Fork-to-goal XY distance — pulls fork toward goal THROUGH the object */
-    float dgx = fk_x - target[0];
-    float dgy = fk_y - target[1];
-    float d_fork_goal = sqrtf(dgx*dgx + dgy*dgy);
+    /* Fork-to-object 3D distance */
+    float ddx = fk_x - obj_pos[0];
+    float ddy = fk_y - obj_pos[1];
+    float ddz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_goal);
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj);
 }
 
 /* ================================================================== */
 /*  cost_pusher: two-term running cost                                  */
 /*  1. d(obj, goal)^2 in 2D     (GOAL_WEIGHT)     — PRIMARY            */
-/*  2. d(fork, goal) in XY      (APPROACH_WEIGHT)  — pulls fork to goal */
+/*  2. d(fork, obj) in 3D       (APPROACH_WEIGHT)  — approach guide     */
 /* ================================================================== */
 __device__ float cost_pusher(const float* state, const float* action,
                               const float* target, int t, int H)
@@ -1074,18 +1073,20 @@ __device__ float cost_pusher(const float* state, const float* action,
 
     float fk_x = state[18];
     float fk_y = state[19];
+    float fk_z = state[20];
 
     /* Object-to-goal 2D squared */
     float dx2 = obj_pos[0] - target[0];
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* Fork-to-goal XY — pulls fork toward goal THROUGH the object */
-    float dgx = fk_x - target[0];
-    float dgy = fk_y - target[1];
-    float d_fork_goal = sqrtf(dgx*dgx + dgy*dgy);
+    /* Fork-to-object 3D (includes z — forces arm to descend toward table) */
+    float dx = fk_x - obj_pos[0];
+    float dy = fk_y - obj_pos[1];
+    float dz = fk_z - TABLE_Z;
+    float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
-    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_goal;
+    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj;
 }
 """
 
