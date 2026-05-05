@@ -447,8 +447,8 @@ if __name__ == "__main__":
                         help="Per-step deadline in ms")
     parser.add_argument("--sigma",    type=float, default=0.5,
                         help="MPPI perturbation global scale (multiplied by per-joint weights)")
-    parser.add_argument("--lambda_",  type=float, default=0.5,
-                        help="MPPI temperature")
+    parser.add_argument("--lambda_",  type=float, default=200.0,
+                        help="MPPI temperature (scale with total cost magnitude)")
     parser.add_argument("--steps",    type=int,   default=300,
                         help="Max episode steps")
     parser.add_argument("--device",   type=int,   default=0,

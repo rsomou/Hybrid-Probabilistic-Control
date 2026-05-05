@@ -36,7 +36,12 @@ class Config:
     K: int = 1024                    # number of trajectory samples
     H: int = 50                      # planning horizon — longer = sees full approach+push sequence
                                      # (dt=0.05 * H=50 = 2.5s look-ahead)
-    lambda_: float = 0.5             # temperature — lower = sharper selection of best trajectories
+    lambda_: float = 200.0           # temperature — must be proportional to cost magnitude.
+                                     # With H=50 steps and per-step cost ~10-15, total costs are
+                                     # ~500-900 (std ~200-400).  λ=0.5 made exp(-range/λ) = 0 for
+                                     # every trajectory except the single best, giving w_eff=1.
+                                     # λ=200 gives exp(-400/200)=0.13, so ~100-500 trajectories
+                                     # contribute to the weighted update.
     sigma: float = 0.5               # global perturbation scale — reduced from 0.8 to keep
                                      # rollout noise tighter around the nominal trajectory
     noise_beta: float = 0.8          # temporal correlation for AR(1) applied in control-point space.
