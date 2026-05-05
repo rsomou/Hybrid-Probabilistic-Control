@@ -54,8 +54,9 @@ from dynamics import AnalyticalDynamics
 # Physical constants — keep in sync with CUDA #defines in get_cuda_dynamics_code
 # --------------------------------------------------------------------------- #
 NUM_JOINTS     = 7
-CONTACT_RADIUS = 0.17       # metres — enlarged contact zone so PF can detect proximity
-PUSH_STRENGTH  = 20.0       # N / (m/s) — strong enough for reaction signal to exceed obs_noise
+CONTACT_RADIUS = 0.20       # metres — enlarged to match MuJoCo stiffened geom margins
+PUSH_STRENGTH  = 50.0       # N / (m/s) — increased to better match MuJoCo's near-rigid
+                             # constraint contact with 0.5kg object + damping=2.0
 FRICTION       = 0.5        # object slide-joint damping coefficient (matches MuJoCo damping="0.5")
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
 INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * INNER_DT)
@@ -675,8 +676,8 @@ def _generate_cuda_code():
         "#define ACTION_DIM      7\n"
         "#define NUM_JOINTS      7\n"
         "#define OBS_DIM         16\n"
-        "#define CONTACT_RADIUS  0.17f\n"
-        "#define PUSH_STRENGTH   20.0f\n"
+        f"#define CONTACT_RADIUS  {CONTACT_RADIUS:.2f}f\n"
+        f"#define PUSH_STRENGTH   {PUSH_STRENGTH:.1f}f\n"
         "#define FRICTION        0.5f\n"
         "#define ACTION_BOUND    2.0f\n"
         "#define N_SUBSTEPS      5\n"

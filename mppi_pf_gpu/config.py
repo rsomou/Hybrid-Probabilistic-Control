@@ -34,23 +34,21 @@ class Config:
     # MPPI
     # ------------------------------------------------------------------ #
     K: int = 1024                    # number of trajectory samples
-    H: int = 50                      # planning horizon — longer = sees full approach+push sequence
-                                     # (dt=0.05 * H=50 = 2.5s look-ahead)
-    lambda_: float = 200.0           # temperature — must be proportional to cost magnitude.
-                                     # With H=50 steps and per-step cost ~10-15, total costs are
-                                     # ~500-900 (std ~200-400).  λ=0.5 made exp(-range/λ) = 0 for
-                                     # every trajectory except the single best, giving w_eff=1.
-                                     # λ=200 gives exp(-400/200)=0.13, so ~100-500 trajectories
-                                     # contribute to the weighted update.
-    sigma: float = 0.5               # global perturbation scale — reduced from 0.8 to keep
-                                     # rollout noise tighter around the nominal trajectory
-    noise_beta: float = 0.8          # temporal correlation for AR(1) applied in control-point space.
-                                     # eps_cp[t] = beta*eps_cp[t-1] + sqrt(1-beta^2)*white[t]
-                                     # The spline interpolation then smooths CPs → H steps automatically.
-    action_alpha: float = 0.5        # EMA smoothing on output action.
-                                     # a_out = alpha*a_prev + (1-alpha)*a_mppi
-                                     # 0 = no smoothing, 1 = frozen
-                                     # 0.5 = equal blend, halves step-to-step variation
+    H: int = 20                      # planning horizon — 1s look-ahead.
+                                     # Shorter = less model-reality divergence during contact.
+                                     # The analytical contact model disagrees with MuJoCo's
+                                     # constraint solver, so long rollouts accumulate error.
+    lambda_: float = 80.0            # temperature — scaled proportionally to H.
+                                     # H=20, per-step cost ~4-8, total ~80-160.
+                                     # λ=80 gives exp(-80/80)=0.37, w_eff ≈ 500-1000.
+    sigma: float = 0.8               # global perturbation scale — wider exploration to find
+                                     # contact configurations after bouncing off the object.
+    noise_beta: float = 0.5          # AR(1) temporal correlation — lower = faster recovery.
+                                     # β=0.8 was too sticky: after losing contact the planner
+                                     # kept replaying the old approach shape.  β=0.5 lets it
+                                     # find new trajectories within 2-3 steps.
+    action_alpha: float = 0.3        # EMA smoothing on output action.
+                                     # Lower = faster reaction to plan changes after contact.
     N_CP: int = 6                    # number of spline control points per rollout trajectory.
                                      # Noise is sampled as (K, N_CP, 7) then linearly interpolated
                                      # to (K, H, 7) before rollout — reduces effective sample
