@@ -124,6 +124,7 @@ class MPPI:
             (self.H, self.dynamics.action_dim), dtype=cp.float32
         )
         self._prev_action = np.zeros(self.dynamics.action_dim, dtype=np.float32)
+        self._step = 0
 
     # ------------------------------------------------------------------ #
     # Core planning step
@@ -252,6 +253,48 @@ class MPPI:
             self._weights *= mask
 
         self.gpu.parallel_normalize(self._weights)
+
+        # ---- MPPI diagnostics (every 10 steps) ----------------------------
+        if hasattr(self, '_step') and self._step % 10 == 0:
+            c = cp.asnumpy(self._costs[:K])
+            w = cp.asnumpy(self._weights[:K])
+            ubar_cpu = cp.asnumpy(self.u_bar)
+            eps_cpu  = cp.asnumpy(self._eps[:K])
+
+            # Cost landscape
+            c_mean, c_std = float(c.mean()), float(c.std())
+            c_min, c_max  = float(c.min()),  float(c.max())
+            c_range       = c_max - c_min
+            c_cv          = c_std / (c_mean + 1e-8)  # coefficient of variation
+
+            # Weight concentration (effective K)
+            w_eff = 1.0 / (float((w ** 2).sum()) + 1e-12)
+            w_max = float(w.max())
+
+            # u_bar magnitude (how much nominal plan has developed)
+            ubar_rms = float(np.sqrt((ubar_cpu[:, :6] ** 2).mean()))
+
+            # eps magnitude across rollouts
+            eps_rms = float(np.sqrt((eps_cpu[:, :, :6] ** 2).mean()))
+
+            # Per-joint eps spread (std across K rollouts at t=0)
+            eps_t0_std = eps_cpu[:, 0, :].std(axis=0)
+
+            print(
+                f"  MPPI step {self._step}: "
+                f"cost mean={c_mean:.1f} std={c_std:.2f} "
+                f"range={c_range:.2f} CV={c_cv:.4f} | "
+                f"w_eff={w_eff:.0f}/{K} w_max={w_max:.4f} | "
+                f"ubar_rms={ubar_rms:.3f} eps_rms={eps_rms:.3f}"
+            )
+            print(
+                f"           "
+                f"eps_t0_std/joint=[{', '.join(f'{s:.3f}' for s in eps_t0_std)}] | "
+                f"cost p5={np.percentile(c,5):.1f} p50={np.percentile(c,50):.1f} "
+                f"p95={np.percentile(c,95):.1f}"
+            )
+        if hasattr(self, '_step'):
+            self._step += 1
 
         # 4. Weighted accumulation of ε → u_bar delta
         #    Each thread handles one (t, a) pair; inner loop over K
