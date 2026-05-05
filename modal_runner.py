@@ -22,6 +22,8 @@ image = (
         "gymnasium[other]",
         "mujoco",
         "cupy-cuda12x",
+        "nvidia-cuda-nvrtc-cu12",
+        "nvidia-cuda-runtime-cu12",
         "imageio",
         "imageio-ffmpeg",
         "moviepy",
