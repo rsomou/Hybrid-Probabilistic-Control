@@ -55,7 +55,7 @@ from dynamics import AnalyticalDynamics
 # --------------------------------------------------------------------------- #
 NUM_JOINTS     = 7
 CONTACT_RADIUS = 0.25       # metres — enlarged so fork equilibrium (~0.21m) is inside contact shell
-PUSH_STRENGTH  = 50.0       # N / (m/s) — contact force magnitude
+PUSH_STRENGTH  = 80.0       # N / (m/s) — contact force magnitude (increased to sustain push near goal)
 OBJ_MASS       = 0.5        # kg — must match runner.py model.body_mass[obj_body_id]
 FRICTION       = 2.0        # object slide-joint damping — must match runner.py dof_damping=2.0
 FRAME_SKIP     = 5          # number of inner integration substeps per control step
@@ -63,7 +63,7 @@ INNER_DT       = 0.01       # MuJoCo inner timestep (control dt = FRAME_SKIP * I
 
 # --- Cost function weights ---
 TABLE_Z         = -0.275  # z-height of the object on the table (from MJCF body pos)
-GOAL_WEIGHT     = 100.0   # weight on d(obj, goal)^2 — squared so gradient doesn't vanish
+GOAL_WEIGHT     = 200.0   # weight on d(obj, goal)^2 — doubled so gradient stays strong near goal
 APPROACH_WEIGHT = 15.0    # weight on d(fork, obj) in 3D — pulls arm deeper into contact range
 TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
 JLIMIT_WEIGHT   = 0.5     # soft joint-limit avoidance — steers rollouts away from saturated joints
