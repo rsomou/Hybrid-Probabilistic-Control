@@ -54,7 +54,11 @@ class Config:
     # Per-joint sigma multipliers for Pusher-v5 (7 joints):
     #   0=shoulder_pan, 1=shoulder_lift, 2=upper_arm_roll,
     #   3=elbow_flex,   4=forearm_roll,  5=wrist_flex, 6=wrist_roll
-    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.5)
+    # wrist_roll (6) is frozen: sigma=0 so no perturbation is ever sampled,
+    # and u_bar[:,6] is pinned to 0 after every update in mppi.py.
+    # Rationale: J_6=0 always (zero-offset joint), so action[6] cannot
+    # transfer force to the object and is a pure waste of action budget.
+    sigma_joint_weights: tuple = (1.5, 1.2, 1.0, 2.0, 0.8, 0.8, 0.0)
 
     elite_frac: float = 0.3          # fraction of lowest-cost rollouts used for u_bar update.
                                      # Weights for the other (1-elite_frac)*K trajectories are

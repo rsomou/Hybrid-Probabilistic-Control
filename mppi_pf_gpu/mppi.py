@@ -269,12 +269,16 @@ class MPPI:
             ),
         )
 
-        # 5. Update u_bar and clip to action bounds
+        # 5. Update u_bar and clip to action bounds.
+        #    Pin column 6 (wrist_roll) to zero: J_6=0 always so the joint
+        #    cannot transfer force to the object, and leaving it free causes
+        #    the planner to waste action budget on rotation.
         self.u_bar = cp.clip(
             self.u_bar + u_bar_delta,
             self.action_low,
             self.action_high,
         )
+        self.u_bar[:, 6] = 0.0
 
         # 6. Extract first action, shift horizon (receding horizon).
         action_raw = cp.asnumpy(self.u_bar[0].copy())
@@ -285,6 +289,7 @@ class MPPI:
         alpha  = self.config.action_alpha
         action = alpha * self._prev_action + (1.0 - alpha) * action_raw
         action = np.clip(action, -2.0, 2.0).astype(np.float32)
+        action[6] = 0.0   # wrist_roll frozen — keep it zeroed after EMA blend
         self._prev_action = action.copy()
 
         return action, timing
