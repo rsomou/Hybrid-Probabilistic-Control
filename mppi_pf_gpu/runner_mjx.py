@@ -4,13 +4,11 @@ CPU-side orchestration loop for MJX-based MPPI + Particle Filter on Pusher-v5.
 
 This replaces runner.py with JAX/MJX dynamics instead of CuPy/CUDA.
 The control loop structure is identical — only the dynamics backend changes.
-
-Until Step 3, the PF is not available (requires --no-pf).  After Step 3,
-the PF will use JAX/MJX dynamics as well.
 """
 
 import argparse
 import time
+from collections import deque
 
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
@@ -27,6 +25,7 @@ from dynamics_mjx import (
     BEHIND_DIST,
 )
 from mppi_mjx import MPPI_MJX
+from particle_filter_mjx import ParticleFilter_MJX
 
 
 # --------------------------------------------------------------------------- #
@@ -45,14 +44,14 @@ def _get_target(obs: np.ndarray) -> np.ndarray:
 def run(config: Config, render: bool = False, record: bool = False,
         no_pf: bool = False, skip_parity: bool = False):
     """
-    Execute one episode of Pusher-v5 with MJX-based MPPI.
+    Execute one episode of Pusher-v5 with MJX-based MPPI (+ Particle Filter).
 
     Parameters
     ----------
     config : Config
     render : bool
     record : bool
-    no_pf  : bool — if True, bypass PF and use perfect state (required until Step 3)
+    no_pf  : bool — if True, bypass PF and give MPPI perfect state from env
     skip_parity : bool — if True, skip the startup parity check
 
     Returns
@@ -60,11 +59,6 @@ def run(config: Config, render: bool = False, record: bool = False,
     total_reward : float
     timing_log   : list[dict]
     """
-    if not no_pf:
-        print("ERROR: PF not yet available with MJX backend. Use --no-pf.")
-        print("  (PF migration is Step 3; this is Step 2 — MPPI only.)")
-        return 0.0, []
-
     # ---- Environment -------------------------------------------------------
     if record:
         render_mode = "rgb_array"
@@ -95,6 +89,12 @@ def run(config: Config, render: bool = False, record: bool = False,
     mjx_dyn = MJXDynamics()  # loads & modifies its own copy of the MJCF
     mppi = MPPI_MJX(mjx_dyn, config)
 
+    # ---- Particle Filter (optional) ----------------------------------------
+    pf = None
+    if not no_pf:
+        print("Initializing MJX particle filter...")
+        pf = ParticleFilter_MJX(mjx_dyn, config)
+
     # ---- Startup parity check (10 steps) -----------------------------------
     if not skip_parity:
         print("\nRunning startup parity check...")
@@ -109,13 +109,22 @@ def run(config: Config, render: bool = False, record: bool = False,
         apply_model_modifications(model)
         mujoco.mj_forward(model, data)
 
-    # ---- Target + reset MPPI -----------------------------------------------
+    # ---- Target + component reset ------------------------------------------
     target = _get_target(obs)
     mppi.set_target(target)
     mppi.reset()
+    if pf is not None:
+        pf.initialize(obs)
 
     total_reward = 0.0
     timing_log = []
+    resample_count = 0
+
+    # ---- Observation-delay buffers -----------------------------------------
+    obs_buffer = deque(maxlen=config.obs_delay + 1)
+    action_buffer = deque(maxlen=config.obs_delay + 1)
+    obs_buffer.append(obs.copy())
+    prev_delayed_obs = obs.copy()
 
     # ---- Initial diagnostics -----------------------------------------------
     q0 = obs[0:7]
@@ -126,24 +135,83 @@ def run(config: Config, render: bool = False, record: bool = False,
     print(f"  fork0  = ({fork0[0]:+.3f}, {fork0[1]:+.3f}, {fork0[2]:+.3f})")
     print(f"  obj0   = ({obj0[0]:+.3f}, {obj0[1]:+.3f}, {obj0[2]:+.3f})")
     print(f"  goal   = ({target[0]:+.3f}, {target[1]:+.3f})")
+    print(f"  mode   = {'no-PF (perfect state)' if no_pf else 'PF + MPPI'}")
     print(f"{'='*60}\n")
 
     # ---- Control loop -------------------------------------------------------
     for t in range(config.max_steps):
         step_start = time.perf_counter()
 
-        # ========================= PLANNING ================================
-        # --no-pf mode: give MPPI the exact env state
-        qpos = data.qpos.copy()
-        qvel = data.qvel.copy()
+        # ========================= STATE ESTIMATION ========================
+        if no_pf:
+            # Perfect-information mode: use env state directly
+            qpos = data.qpos.copy()
+            qvel = data.qvel.copy()
+            ess = float(config.N)  # sentinel
+        else:
+            # ---- PF path: delay-aware estimation --------------------------
+            delayed_obs = obs_buffer[0]  # oldest buffered obs (d steps old)
 
+            # PF inject + propagate: only after action buffer has d+1 entries
+            if len(action_buffer) > config.obs_delay:
+                delayed_action = action_buffer[0]
+                pf.inject_observation(prev_delayed_obs)
+                pf.propagate(delayed_action)
+
+            # Weight update against delayed observation
+            pf.update(delayed_obs)
+            ess = pf.effective_sample_size()
+
+            if ess < config.resample_threshold * config.N:
+                pf.resample()
+                resample_count += 1
+
+            # Inject current delayed obs before estimation
+            pf.inject_observation(delayed_obs)
+
+            # Weighted mean state estimate for MPPI
+            qpos, qvel = pf.estimate_qpos_qvel()
+
+            # Propagate mean through delay actions (catch up to current time)
+            if len(action_buffer) > config.obs_delay:
+                recent_actions = list(action_buffer)[1:]
+            else:
+                recent_actions = list(action_buffer)
+
+            # For delay compensation: step the estimated state through
+            # recent actions using the C-side MuJoCo (fast, single state).
+            # This avoids JIT overhead for a single-particle propagation.
+            for act in recent_actions:
+                mjx_dyn._mj_data.qpos[:] = qpos.astype(np.float64)
+                mjx_dyn._mj_data.qvel[:] = qvel.astype(np.float64)
+                mjx_dyn._mj_data.ctrl[:] = act.astype(np.float64)
+                mujoco.mj_step(mjx_dyn.mj_model, mjx_dyn._mj_data,
+                               nstep=5)  # frame_skip=5
+                qpos = mjx_dyn._mj_data.qpos.copy().astype(np.float32)
+                qvel = mjx_dyn._mj_data.qvel.copy().astype(np.float32)
+
+        t_est_end = time.perf_counter()
+
+        # ========================= PLANNING ================================
         action, mppi_timing = mppi.compute_action(qpos, qvel)
 
         t_plan_end = time.perf_counter()
 
         # ========================= ENV STEP ================================
+        if not no_pf:
+            prev_delayed_obs = obs_buffer[0]
+
         obs, reward, terminated, truncated, _info = env.step(action)
         obs = obs.astype(np.float32)
+
+        # Sensor noise + delay buffers
+        noisy_obs = obs.copy()
+        if not no_pf:
+            noisy_obs += np.random.normal(
+                0.0, config.sensor_noise_std, obs.shape,
+            ).astype(np.float32)
+        obs_buffer.append(noisy_obs)
+        action_buffer.append(action.copy())
 
         t_env_end = time.perf_counter()
         # ===================================================================
@@ -151,16 +219,17 @@ def run(config: Config, render: bool = False, record: bool = False,
         total_reward += reward
 
         # ---- Timing record ------------------------------------------------
-        T_plan_ms = (t_plan_end - step_start) * 1e3
+        T_est_ms = (t_est_end - step_start) * 1e3
+        T_plan_ms = (t_plan_end - t_est_end) * 1e3
         T_env_ms = (t_env_end - t_plan_end) * 1e3
         T_total_ms = (t_env_end - step_start) * 1e3
 
         timing_entry = {
             "step": t,
             "T_total_ms": T_total_ms,
-            "T_gpu_ms": T_plan_ms,  # "gpu" = planning time (JAX)
+            "T_gpu_ms": T_est_ms + T_plan_ms,
             "T_env_ms": T_env_ms,
-            "ESS": float(config.N),  # no PF → sentinel
+            "ESS": ess,
             "K_used": mppi._K_active,
             "reward": float(reward),
             "deadline_ms": config.deadline_ms,
@@ -172,7 +241,9 @@ def run(config: Config, render: bool = False, record: bool = False,
             print(
                 f"Step {t:4d} | "
                 f"R={reward:7.3f} | "
-                f"T={T_total_ms:6.2f}ms (plan={T_plan_ms:5.2f} env={T_env_ms:5.2f}) | "
+                f"T={T_total_ms:6.2f}ms "
+                f"(est={T_est_ms:5.2f} plan={T_plan_ms:5.2f} env={T_env_ms:5.2f}) | "
+                f"ESS={ess:6.0f}/{config.N} | "
                 f"K={mppi.K}"
             )
 
@@ -189,6 +260,13 @@ def run(config: Config, render: bool = False, record: bool = False,
                 f"obj=({real_obj[0]:+.3f},{real_obj[1]:+.3f}) "
                 f"fork→obj_3d={fork_obj_3d:.3f}m"
             )
+            if pf is not None:
+                pf_obj = pf.get_obj_mean_world()
+                pf_err = float(np.linalg.norm(pf_obj - real_obj[:2]))
+                print(
+                    f"         PF: obj_mean=({pf_obj[0]:+.3f},{pf_obj[1]:+.3f}) "
+                    f"err={pf_err:.3f}m  ESS={ess:.0f}"
+                )
 
         if terminated or truncated:
             break
@@ -198,7 +276,7 @@ def run(config: Config, render: bool = False, record: bool = False,
     # ---- Summary -----------------------------------------------------------
     n_steps = len(timing_log)
     avg_total_ms = float(np.mean([r["T_total_ms"] for r in timing_log]))
-    avg_plan_ms = float(np.mean([r["T_gpu_ms"] for r in timing_log]))
+    avg_gpu_ms = float(np.mean([r["T_gpu_ms"] for r in timing_log]))
     avg_env_ms = float(np.mean([r["T_env_ms"] for r in timing_log]))
     deadline_hits = sum(
         1 for r in timing_log if r["T_total_ms"] <= config.deadline_ms
@@ -208,9 +286,11 @@ def run(config: Config, render: bool = False, record: bool = False,
     print(f"  Total reward  : {total_reward:.3f}")
     print(f"  Steps         : {n_steps}")
     print(f"  Avg step time : {avg_total_ms:.2f} ms  "
-          f"(plan={avg_plan_ms:.2f}  env={avg_env_ms:.2f})")
+          f"(gpu={avg_gpu_ms:.2f}  env={avg_env_ms:.2f})")
     print(f"  Deadline hits : {deadline_hits}/{n_steps} "
           f"({100*deadline_hits/max(n_steps,1):.1f}%  <= {config.deadline_ms:.0f} ms)")
+    print(f"  PF resamples  : {resample_count} / {n_steps} steps "
+          f"({'N/A — --no-pf' if no_pf else f'{100*resample_count/max(n_steps,1):.1f}%'})")
     print(f"{'='*60}")
 
     np.save("timing_log.npy", timing_log)
