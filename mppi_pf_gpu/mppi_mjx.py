@@ -20,22 +20,18 @@ JIT compile times (first call; same-shape calls use cache):
 """
 
 import time
-from functools import partial
 
 import numpy as np
 import jax
 import jax.numpy as jnp
 from jax import lax
-from mujoco import mjx
 
 from dynamics_mjx import (
     step_one,
-    reset_data,
     cost_step,
     terminal_cost,
     ACTION_DIM,
     ACTION_BOUND,
-    TABLE_Z,
 )
 
 
@@ -259,7 +255,7 @@ class MPPI_MJX:
             # ---- 1. Sample temporally-correlated perturbations ----
             # eps[k, t, a] with AR(1): eps[t] = β·eps[t-1] + √(1-β²)·white[t]
             # white has per-joint sigma scaling applied.
-            key_white, key_rest = jax.random.split(rng_key)
+            key_white, _ = jax.random.split(rng_key)
             white = jax.random.normal(key_white, (K, H, ACTION_DIM),
                                       dtype=jnp.float32) * sigma_vec
 

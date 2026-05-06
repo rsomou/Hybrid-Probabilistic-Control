@@ -23,14 +23,9 @@ Particles are stored as:
     particle_qvel : (N, nv) — generalised velocities
 """
 
-import time
-from functools import partial
-
 import numpy as np
 import jax
 import jax.numpy as jnp
-from jax import lax
-import mujoco
 from mujoco import mjx
 
 from dynamics_mjx import step_one, reset_data

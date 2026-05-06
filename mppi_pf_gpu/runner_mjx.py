@@ -22,7 +22,6 @@ from dynamics_mjx import (
     apply_model_modifications,
     verify_parity,
     TABLE_Z,
-    BEHIND_DIST,
 )
 from mppi_mjx import MPPI_MJX
 from particle_filter_mjx import ParticleFilter_MJX
