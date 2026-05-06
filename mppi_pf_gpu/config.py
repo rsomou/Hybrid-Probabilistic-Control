@@ -103,7 +103,7 @@ class Config:
     # Future scheduler placeholders — do NOT implement logic here
     # These are stored for the adaptive scheduler to read and modify.
     # ------------------------------------------------------------------ #
-    K_min: int = 64
+    K_min: int = 4
     K_max: int = 4096
     safety_margin_ms: float = 2.0
 
