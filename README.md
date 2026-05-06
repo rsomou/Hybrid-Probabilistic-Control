@@ -102,11 +102,15 @@ Then shift the horizon forward by one step, appending a zero action at the end.
 
 Running cost (per step):
 
-$$c(s, a) = 200 \cdot \|p_{\text{obj}} - p_{\text{goal}}\|^2 + 15 \cdot \|p_{\text{fork}} - p_{\text{obj}}\|_{\text{3D}} + 0.5 \sum_{j=1}^{7} \left(e^{-10(q_j - q_j^{\min})} + e^{-10(q_j^{\max} - q_j)}\right)$$
+$$c(s, a) = 200 \cdot \|p_{\text{obj}} - p_{\text{goal}}\|^2 + 15 \cdot \|p_{\text{fork}} - p_{\text{behind}}\|_{\text{3D}} + 0.5 \sum_{j=1}^{7} \left(e^{-10(q_j - q_j^{\min})} + e^{-10(q_j^{\max} - q_j)}\right)$$
+
+where the behind-point is 6 cm behind the object opposite to the goal direction:
+
+$$p_{\text{behind}} = p_{\text{obj}} - 0.06 \cdot \frac{p_{\text{goal}} - p_{\text{obj}}}{\|p_{\text{goal}} - p_{\text{obj}}\|}$$
 
 where the three terms are:
 - **Goal distance** (squared) drives the object toward the target
-- **Fork-to-object distance** (3D, includes z) pulls the arm toward the object
+- **Fork-to-behind-point distance** (3D, includes z) pulls the arm to a point 6 cm behind the object along the push axis, encoding both proximity and correct approach direction
 - **Joint limit barrier** (exponential) steers away from joint saturation
 
 Terminal cost at step $H$:
@@ -243,7 +247,7 @@ The planning model uses **full RNEA (Recursive Newton-Euler Algorithm)**:
 - **Integration:** 5 semi-implicit Euler substeps per control step (inner dt = 0.01 s)
 - **Joint limits:** All 7 joints have position limits matching the MJCF; velocity zeroed on contact
 - **FK:** Full 7-DOF forward kinematics returning the r_wrist_roll_link body origin (fork collision center)
-- **Contact:** When 3D fork-to-object distance < 0.17 m, a push force proportional to fork velocity in the contact normal direction is applied to the object
+- **Contact:** When 3D fork-to-object distance < 0.25 m, a push force proportional to fork velocity in the contact normal direction is applied to the object
 
 Both CPU (numpy) and GPU (CUDA) implementations exist. RNEA link parameters are computed from MJCF geom specs at import time and baked into the CUDA source as device constants.
 
