@@ -74,7 +74,7 @@ Joint 6 (wrist_roll) has its sigma set to 0 and its nominal plan pinned to zero,
 
 **(2) Form candidates.**
 
-$$u_t^{(k)} = \text{clip}(\overline{u}_t + \varepsilon_t^{(k)},\; -2,\; 2)$$
+$$u_t^{(k)} = \text{clip}(\overline{u}_t + \varepsilon_t^{(k)}, -2, 2)$$
 
 **(3) Seed rollouts.** All $K$ rollouts start from the PF weighted mean state (single estimate, tiled). Using diverse particle samples as initial states injected initial-condition noise that dominated the action-quality signal.
 
@@ -90,7 +90,7 @@ $$w_k = \frac{\exp\left(-(S_k - S_{\min}) / \lambda\right)}{\sum_{j=1}^{K} \exp\
 
 **(6) Update nominal sequence:**
 
-$$\overline{u} \leftarrow \text{clip}\left(\overline{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)},\; -2,\; 2\right)$$
+$$\overline{u} \leftarrow \text{clip}\left(\overline{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)}, -2, 2\right)$$
 
 **(7) Execute and shift.** Apply the first action $\overline{u}_0$ with EMA smoothing at $\alpha = 0.3$:
 
