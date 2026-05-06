@@ -35,13 +35,16 @@ from collections import deque
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 import numpy as np
-import cupy as cp
 
 from config import Config
-from envs.pusher import PusherDynamics, CONTACT_RADIUS, TABLE_Z
-from gpu_utils import GPUUtils
-from particle_filter import ParticleFilter
-from mppi import MPPI
+
+# CuPy and CUDA-based modules are imported lazily inside run() to allow
+# the --backend mjx path to work without CuPy installed.
+# import cupy as cp
+# from envs.pusher import PusherDynamics, CONTACT_RADIUS, TABLE_Z
+# from gpu_utils import GPUUtils
+# from particle_filter import ParticleFilter
+# from mppi import MPPI
 
 
 # --------------------------------------------------------------------------- #
@@ -86,6 +89,7 @@ def run(config: Config, render: bool = False, record: bool = False,
         no_pf: bool = False):
     """
     Execute one episode of Pusher-v5 with MPPI (+ Particle Filter unless no_pf).
+    Uses the analytical RNEA + CUDA dynamics backend (requires CuPy + NVIDIA GPU).
 
     Parameters
     ----------
@@ -99,6 +103,13 @@ def run(config: Config, render: bool = False, record: bool = False,
     total_reward : float
     timing_log   : list[dict]  — one entry per step
     """
+    # Lazy imports for CuPy/CUDA dependencies
+    import cupy as cp
+    from envs.pusher import PusherDynamics, CONTACT_RADIUS, TABLE_Z
+    from gpu_utils import GPUUtils
+    from particle_filter import ParticleFilter
+    from mppi import MPPI
+
     # ---- Environment -------------------------------------------------------
     if record:
         render_mode = "rgb_array"
@@ -461,6 +472,11 @@ if __name__ == "__main__":
                         help="Suppress per-step timing output")
     parser.add_argument("--no-pf",    action="store_true",
                         help="Bypass particle filter; give MPPI perfect state from obs")
+    parser.add_argument("--backend", type=str, default="mjx",
+                        choices=["analytical", "mjx"],
+                        help="Dynamics backend: 'analytical' (CUDA RNEA) or 'mjx' (JAX/MJX)")
+    parser.add_argument("--skip-parity", action="store_true",
+                        help="Skip startup MJX parity check (MJX backend only)")
     args = parser.parse_args()
 
     cfg = Config(
@@ -475,4 +491,11 @@ if __name__ == "__main__":
         enable_timing  = not args.no_timing,
     )
 
-    run(cfg, render=args.render, record=args.record, no_pf=args.no_pf)
+    if args.backend == "mjx":
+        # Use JAX/MJX dynamics (recommended — zero rollout-vs-real mismatch)
+        from runner_mjx import run as run_mjx
+        run_mjx(cfg, render=args.render, record=args.record,
+                no_pf=args.no_pf, skip_parity=args.skip_parity)
+    else:
+        # Use analytical RNEA + CUDA dynamics (requires CuPy + NVIDIA GPU)
+        run(cfg, render=args.render, record=args.record, no_pf=args.no_pf)
