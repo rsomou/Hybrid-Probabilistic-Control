@@ -38,9 +38,9 @@ where $s_t$ is the state, $a_t$ is the action, $o_t$ is the observation, and the
 
 ### Particle Filter (State Estimation)
 
-The posterior $p(s_t \mid o_{0:t}, a_{0:t-1})$ is approximated by $N = 1000$ weighted particles $\{(s^{(i)}_t, w^{(i)}_t)\}_{i=1}^{N}$.
+The posterior $p(s_t \mid o_{0:t}, a_{0:t-1})$ is approximated by $N = 1000$ weighted particles. Each particle $i$ carries a state $s_t^{(i)}$ and a weight $w_t^{(i)}$.
 
-**Rao-Blackwellization:** Each step, the observed joint state $(q, \dot{q})$ is injected into all particles with tiny jitter. Only the hidden object position differs between particles. This keeps the one-step contact signal as the dominant discriminator for weight updates.
+**Rao-Blackwellization:** Each step, the observed joint state (q, qdot) is injected into all particles with tiny jitter. Only the hidden object position differs between particles. This keeps the one-step contact signal as the dominant discriminator for weight updates.
 
 Each step has three stages:
 
@@ -48,13 +48,13 @@ Each step has three stages:
 
 $$s_t^{(i)} \sim f(s_{t-1}^{(i)}, a_{t-1}) + \mathcal{N}(0, \sigma_p^2 I)$$
 
-Process noise is applied only to the object position dimensions ($\sigma_p = 0.01$). Joint dimensions receive zero noise since they are injected from observations.
+Process noise is applied only to the object position dimensions with $\sigma_p = 0.01$. Joint dimensions receive zero noise since they are injected from observations.
 
 **(2) Weighting.** Multiply each particle's weight by a Gaussian likelihood on the object position dimensions only (joint dimensions are identical across particles after injection):
 
 $$w_t^{(i)} \propto w_{t-1}^{(i)} \cdot \exp\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
 
-Weights are renormalized to sum to one. Two noise scales are used: $\sigma_o = 0.01$ for joint dimensions and $\sigma_o = 0.05$ for object position.
+Weights are renormalized to sum to one. Two noise scales are used: $\sigma_o = 0.01$ for joint dimensions and $\sigma_o^{\text{obj}} = 0.05$ for object position.
 
 **(3) Resampling.** When the effective sample size
 
@@ -64,13 +64,13 @@ drops below $0.5 \times N$, draw $N$ replacement particles using systematic resa
 
 ### MPPI (Stochastic Optimal Control)
 
-MPPI frames finite-horizon control as inference. Given a nominal action sequence $\overline{u} = \{u_0, \dots, u_{H-1}\}$ (warm-started from the previous step):
+MPPI frames finite-horizon control as inference. Given a nominal action sequence $\overline{u}$ of length $H$ (warm-started from the previous step):
 
-**(1) Sample perturbations.** Draw $K = 1024$ noise sequences. Noise is sampled as $(K, N_{CP}, 7)$ control points, then linearly interpolated to $(K, H, 7)$ steps. AR(1) temporal correlation ($\beta = 0.5$) smooths the sequences:
+**(1) Sample perturbations.** Draw $K = 1024$ noise sequences. Noise is sampled as $K \times N_{CP} \times 7$ control points, then linearly interpolated to $K \times H \times 7$ steps. AR(1) temporal correlation with $\beta = 0.5$ smooths the sequences:
 
 $$\varepsilon_t^{(k)} = \beta \, \varepsilon_{t-1}^{(k)} + \sqrt{1 - \beta^2} \, \eta_t^{(k)}, \quad \eta_t^{(k)} \sim \mathcal{N}(0, \sigma^2 \cdot \text{diag}(\sigma_{\text{joint}}))$$
 
-Joint 6 (wrist_roll) has $\sigma_{\text{joint}}[6] = 0$ and its nominal plan $\overline{u}_{:,6}$ is pinned to zero, since $J_6 = 0$ always (zero FK offset) and it cannot transfer force to the object.
+Joint 6 (wrist_roll) has its sigma set to 0 and its nominal plan pinned to zero, since $J_6 = 0$ always (zero FK offset) and it cannot transfer force to the object.
 
 **(2) Form candidates.**
 
@@ -92,11 +92,11 @@ $$w_k = \frac{\exp\left(-(S_k - S_{\min}) / \lambda\right)}{\sum_{j=1}^{K} \exp\
 
 $$\overline{u} \leftarrow \text{clip}\left(\overline{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)},\; -2,\; 2\right)$$
 
-**(7) Execute and shift.** Apply $\overline{u}_0$ with EMA smoothing ($\alpha = 0.3$):
+**(7) Execute and shift.** Apply the first action $\overline{u}_0$ with EMA smoothing at $\alpha = 0.3$:
 
 $$a_t = \alpha \, a_{t-1} + (1 - \alpha) \, \overline{u}_0$$
 
-Then shift the horizon: $\{\overline{u}_0, \dots, \overline{u}_{H-1}\} \to \{\overline{u}_1, \dots, \overline{u}_{H-1}, 0\}$.
+Then shift the horizon forward by one step, appending a zero action at the end.
 
 ### Cost Function
 
@@ -117,7 +117,7 @@ The 10x multiplier forces the planner to end trajectories in good configurations
 
 ### Observation Delay
 
-The PF operates with a configurable delay ($d = 3$ steps). Observations are buffered; the PF updates against the observation from $d$ steps ago. For MPPI, the PF mean is propagated forward through the $d$ recent actions on GPU to produce a current-time state estimate.
+The PF operates with a configurable delay of $d = 3$ steps. Observations are buffered; the PF updates against the observation from $d$ steps ago. For MPPI, the PF mean is propagated forward through the $d$ recent actions on GPU to produce a current-time state estimate.
 
 ---
 
