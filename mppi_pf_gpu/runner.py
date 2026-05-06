@@ -42,6 +42,7 @@ from envs.pusher import PusherDynamics, CONTACT_RADIUS, TABLE_Z
 from gpu_utils import GPUUtils
 from particle_filter import ParticleFilter
 from mppi import MPPI
+from deadline_scheduler import DeadlineScheduler
 
 
 # --------------------------------------------------------------------------- #
@@ -83,7 +84,7 @@ def _obs_to_state(obs: np.ndarray, dynamics) -> np.ndarray:
 # --------------------------------------------------------------------------- #
 
 def run(config: Config, render: bool = False, record: bool = False,
-        no_pf: bool = False):
+        no_pf: bool = False, deadline_aware: bool = False):
     """
     Execute one episode of Pusher-v5 with MPPI (+ Particle Filter unless no_pf).
 
@@ -93,6 +94,7 @@ def run(config: Config, render: bool = False, record: bool = False,
     render : bool — if True opens the MuJoCo viewer
     record : bool — if True saves an MP4 video to ./videos/
     no_pf  : bool — if True bypass the PF; feed MPPI perfect state from obs
+    deadline_aware : bool — if True, adaptively tune K per step to meet deadline
 
     Returns
     -------
@@ -170,6 +172,12 @@ def run(config: Config, render: bool = False, record: bool = False,
     total_reward   = 0.0
     timing_log     = []
     resample_count = 0    # number of times PF resampled this episode
+
+    # ---- Deadline-aware scheduler ------------------------------------------
+    scheduler = DeadlineScheduler(config) if deadline_aware else None
+    T_gpu_prev_ms  = None   # GPU time from previous step (for scheduler)
+    T_overhead_prev_ms = None  # non-MPPI overhead from previous step
+    prev_weights   = None   # MPPI weights from previous step (for scheduler)
 
     # ---- Observation-delay buffers -----------------------------------------
     # obs_buffer:    maxlen = d+1  (stores delayed obs window)
@@ -289,8 +297,24 @@ def run(config: Config, render: bool = False, record: bool = False,
             t_delay_end = time.perf_counter()
             T_pf_delay_ms = (t_delay_end - t_delay_start) * 1e3
 
+        # ---- Adaptive K (deadline-aware scheduler) ----------------------
+        if scheduler is not None:
+            K_next = scheduler.get_K(T_gpu_prev_ms, prev_weights,
+                                     T_overhead_prev_ms)
+            # Resize initial_states if K changed
+            if K_next != initial_states.shape[0]:
+                if K_next < initial_states.shape[0]:
+                    initial_states = initial_states[:K_next]
+                else:
+                    # Need more copies — tile from the single mean state
+                    initial_states = cp.repeat(
+                        initial_states[0:1], K_next, axis=0
+                    )
+        else:
+            K_next = None  # use MPPI's default K
+
         # MPPI planning
-        action, mppi_timing = mppi.compute_action(initial_states)
+        action, mppi_timing = mppi.compute_action(initial_states, K=K_next)
 
         cp.cuda.Device(config.device_id).synchronize()
         # ========================= END GPU WORK =============================
@@ -321,6 +345,16 @@ def run(config: Config, render: bool = False, record: bool = False,
         T_gpu_ms   = (t_gpu_end - step_start) * 1e3
         T_env_ms   = (t_env_end - t_gpu_end)  * 1e3
         T_total_ms = (t_env_end - step_start) * 1e3
+        T_overhead_ms = T_total_ms - T_gpu_ms  # PF + env + delay = non-MPPI cost
+
+        # ---- Scheduler feedback (for next step's K computation) -----------
+        if scheduler is not None:
+            # Extract weights for uncertainty signal
+            cur_weights = cp.asnumpy(mppi._weights[:mppi._K_active])
+            scheduler.log(mppi._K_active, T_gpu_ms, cur_weights)
+            T_gpu_prev_ms = T_gpu_ms
+            T_overhead_prev_ms = T_overhead_ms
+            prev_weights = cur_weights
 
         timing_entry = {
             "step":       t,
@@ -329,22 +363,24 @@ def run(config: Config, render: bool = False, record: bool = False,
             "T_env_ms":   T_env_ms,
             "T_pf_delay_propagate_ms": T_pf_delay_ms,
             "ESS":        ess,
-            "K_used":     mppi._K_active,  # reflects any per-step K override
+            "K_used":     mppi._K_active,
             "reward":     float(reward),
-            # Scheduler placeholders — future scheduler fills these:
             "deadline_ms":      config.deadline_ms,
             "safety_margin_ms": config.safety_margin_ms,
         }
         timing_log.append(timing_entry)
 
         if config.enable_timing:
+            K_disp = mppi._K_active
+            deadline_status = "OK" if T_total_ms <= config.deadline_ms else "OVER"
             print(
                 f"Step {t:4d} | "
                 f"R={reward:7.3f} | "
                 f"T={T_total_ms:6.2f}ms (GPU={T_gpu_ms:5.2f} ENV={T_env_ms:5.2f} "
                 f"delay={T_pf_delay_ms:5.2f}) | "
                 f"ESS={ess:6.0f}/{config.N} | "
-                f"K={mppi.K}"
+                f"K={K_disp:5d}"
+                + (f" [{deadline_status}]" if deadline_aware else "")
             )
 
         # ---- Diagnostic output every 10 steps ----------------------------
@@ -420,6 +456,13 @@ def run(config: Config, render: bool = False, record: bool = False,
           f"({100*deadline_hits/max(n_steps,1):.1f}%  <= {config.deadline_ms:.0f} ms)")
     print(f"  PF resamples  : {resample_count} / {n_steps} steps "
           f"({'N/A — --no-pf' if no_pf else f'{100*resample_count/max(n_steps,1):.1f}%'})")
+    if scheduler is not None:
+        sched_summary = scheduler.summary()
+        print(f"  Scheduler     : K mean={sched_summary['K_mean']:.0f}  "
+              f"range=[{sched_summary['K_min_used']}, {sched_summary['K_max_used']}]  "
+              f"std={sched_summary['K_std']:.0f}")
+        print(f"                  cost/traj={sched_summary['cost_per_traj_final_ms']:.4f} ms  "
+              f"overhead={sched_summary['overhead_final_ms']:.2f} ms")
     print(f"{'='*60}")
 
     # ---- Save timing log ---------------------------------------------------
@@ -461,6 +504,8 @@ if __name__ == "__main__":
                         help="Suppress per-step timing output")
     parser.add_argument("--no-pf",    action="store_true",
                         help="Bypass particle filter; give MPPI perfect state from obs")
+    parser.add_argument("--deadline-aware", action="store_true",
+                        help="Enable adaptive K scheduling to meet per-step deadline")
     args = parser.parse_args()
 
     cfg = Config(
@@ -475,4 +520,5 @@ if __name__ == "__main__":
         enable_timing  = not args.no_timing,
     )
 
-    run(cfg, render=args.render, record=args.record, no_pf=args.no_pf)
+    run(cfg, render=args.render, record=args.record, no_pf=args.no_pf,
+        deadline_aware=args.deadline_aware)

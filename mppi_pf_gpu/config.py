@@ -87,18 +87,17 @@ class Config:
     device_id: int = 0
 
     # ------------------------------------------------------------------ #
-    # Timing (for future deadline-aware scheduler)
+    # Timing & deadline-aware scheduler
     # ------------------------------------------------------------------ #
-    deadline_ms: float = 50.0        # per-step deadline in milliseconds
-    enable_timing: bool = True       # toggle CUDA event timing
+    deadline_ms: float = 50.0        # per-step wall-clock deadline in milliseconds
+    enable_timing: bool = True       # toggle per-step timing output
 
-    # ------------------------------------------------------------------ #
-    # Future scheduler placeholders — do NOT implement logic here
-    # These are stored for the adaptive scheduler to read and modify.
-    # ------------------------------------------------------------------ #
-    K_min: int = 64
-    K_max: int = 4096
-    safety_margin_ms: float = 2.0
+    # Scheduler bounds — K is adapted per step when --deadline-aware is set.
+    # K starts at `K` and is tuned within [K_min, K_max] each step based on
+    # measured GPU latency, weight-distribution uncertainty, and deadline budget.
+    K_min: int = 64                  # minimum trajectories (quality floor)
+    K_max: int = 4096                # maximum trajectories (GPU memory ceiling)
+    safety_margin_ms: float = 2.0    # headroom subtracted from deadline before scheduling
 
     # ------------------------------------------------------------------ #
     # Convenience
