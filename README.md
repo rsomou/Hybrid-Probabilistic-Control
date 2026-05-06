@@ -52,7 +52,7 @@ Process noise is applied only to the object position dimensions ($\sigma_p = 0.0
 
 **(2) Weighting.** Multiply each particle's weight by a Gaussian likelihood on the object position dimensions only (joint dimensions are identical across particles after injection):
 
-$$w_t^{(i)} \propto w_{t-1}^{(i)} \cdot \exp\!\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
+$$w_t^{(i)} \propto w_{t-1}^{(i)} \cdot \exp\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
 
 Weights are renormalized to sum to one. Two noise scales are used: $\sigma_o = 0.01$ for joint dimensions and $\sigma_o = 0.05$ for object position.
 
@@ -64,17 +64,17 @@ drops below $0.5 \times N$, draw $N$ replacement particles using systematic resa
 
 ### MPPI (Stochastic Optimal Control)
 
-MPPI frames finite-horizon control as inference. Given a nominal action sequence $\bar{u} = \{u_0, \dots, u_{H-1}\}$ (warm-started from the previous step):
+MPPI frames finite-horizon control as inference. Given a nominal action sequence $\overline{u} = \{u_0, \dots, u_{H-1}\}$ (warm-started from the previous step):
 
 **(1) Sample perturbations.** Draw $K = 1024$ noise sequences. Noise is sampled as $(K, N_{CP}, 7)$ control points, then linearly interpolated to $(K, H, 7)$ steps. AR(1) temporal correlation ($\beta = 0.5$) smooths the sequences:
 
 $$\varepsilon_t^{(k)} = \beta \, \varepsilon_{t-1}^{(k)} + \sqrt{1 - \beta^2} \, \eta_t^{(k)}, \quad \eta_t^{(k)} \sim \mathcal{N}(0, \sigma^2 \cdot \text{diag}(\sigma_{\text{joint}}))$$
 
-Joint 6 (wrist_roll) has $\sigma_{\text{joint}}[6] = 0$ and its nominal plan $\bar{u}_{:,6}$ is pinned to zero, since $J_6 = 0$ always (zero FK offset) and it cannot transfer force to the object.
+Joint 6 (wrist_roll) has $\sigma_{\text{joint}}[6] = 0$ and its nominal plan $\overline{u}_{:,6}$ is pinned to zero, since $J_6 = 0$ always (zero FK offset) and it cannot transfer force to the object.
 
 **(2) Form candidates.**
 
-$$u_t^{(k)} = \text{clip}(\bar{u}_t + \varepsilon_t^{(k)},\; -2,\; 2)$$
+$$u_t^{(k)} = \text{clip}(\overline{u}_t + \varepsilon_t^{(k)},\; -2,\; 2)$$
 
 **(3) Seed rollouts.** All $K$ rollouts start from the PF weighted mean state (single estimate, tiled). Using diverse particle samples as initial states injected initial-condition noise that dominated the action-quality signal.
 
@@ -84,19 +84,19 @@ $$S_k = \sum_{t=0}^{H-1} c(s_t^{(k)}, u_t^{(k)}) + c_{\text{terminal}}(s_H^{(k)}
 
 **(5) Compute importance weights** with numerically stable shift:
 
-$$w_k = \frac{\exp\!\left(-(S_k - S_{\min}) / \lambda\right)}{\sum_{j=1}^{K} \exp\!\left(-(S_j - S_{\min}) / \lambda\right)}$$
+$$w_k = \frac{\exp\left(-(S_k - S_{\min}) / \lambda\right)}{\sum_{j=1}^{K} \exp\left(-(S_j - S_{\min}) / \lambda\right)}$$
 
 **Elite filtering:** Only the top 30% lowest-cost trajectories contribute. Weights for the remaining 70% are zeroed before normalization.
 
 **(6) Update nominal sequence:**
 
-$$\bar{u} \leftarrow \text{clip}\!\left(\bar{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)},\; -2,\; 2\right)$$
+$$\overline{u} \leftarrow \text{clip}\left(\overline{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)},\; -2,\; 2\right)$$
 
-**(7) Execute and shift.** Apply $\bar{u}_0$ with EMA smoothing ($\alpha = 0.3$):
+**(7) Execute and shift.** Apply $\overline{u}_0$ with EMA smoothing ($\alpha = 0.3$):
 
-$$a_t = \alpha \, a_{t-1} + (1 - \alpha) \, \bar{u}_0$$
+$$a_t = \alpha \, a_{t-1} + (1 - \alpha) \, \overline{u}_0$$
 
-Then shift the horizon: $\{\bar{u}_0, \dots, \bar{u}_{H-1}\} \to \{\bar{u}_1, \dots, \bar{u}_{H-1}, 0\}$.
+Then shift the horizon: $\{\overline{u}_0, \dots, \overline{u}_{H-1}\} \to \{\overline{u}_1, \dots, \overline{u}_{H-1}, 0\}$.
 
 ### Cost Function
 
