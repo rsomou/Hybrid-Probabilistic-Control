@@ -1,6 +1,15 @@
 # Hybrid-Probabilistic-Control
 
-GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Implemented in Python/CuPy with raw CUDA kernels. Tested on MuJoCo **Pusher-v5** via Gymnasium.
+GPU-accelerated hybrid controller combining a **Particle Filter** (state estimation) with **MPPI** (stochastic optimal control) under real-time deadline constraints. Tested on MuJoCo **Pusher-v5** via Gymnasium.
+
+**Two dynamics backends are available:**
+
+| Backend | Engine | Dependencies | Rollout-vs-real mismatch |
+|---------|--------|--------------|--------------------------|
+| `mjx` (default) | MuJoCo MJX (JAX/XLA) | `jax`, `mujoco-mjx` | **Zero** — same MJCF, same solver |
+| `analytical` | Hand-coded RNEA in CUDA C | `cupy`, NVIDIA GPU | Non-zero (soft-contact model mismatch) |
+
+The MJX backend was introduced to fix a sim-vs-rollout mismatch where the analytical contact model (push force ∝ velocity) disagreed with MuJoCo's constraint-based contact with friction, preventing the controller from actually pushing the object.
 
 The environment is made **partially observable**: the object position (`obs[17:19]`) is included in the PF observation but with a loose noise scale, so the particle filter must converge on the true position from a broad prior. This makes the particle filter genuinely necessary for accurate state estimation.
 
@@ -13,16 +22,50 @@ Hybrid-Probabilistic-Control/
 ├── README.md
 └── mppi_pf_gpu/
     ├── config.py               # All hyperparameters and scheduler placeholders
-    ├── dynamics.py             # Abstract interface every environment must implement
-    ├── gpu_utils.py            # CuPy utility layer (reductions, RNG, scan, grid dims)
-    ├── particle_filter.py      # GPU-resident bootstrap particle filter
-    ├── mppi.py                 # GPU-resident MPPI controller with spline CP sampling
-    ├── runner.py               # CPU orchestration loop with timing instrumentation
+    ├── dynamics.py             # Abstract interface (used by analytical backend)
+    ├── dynamics_mjx.py         # MJX model setup, step_one, cost functions, parity check
+    ├── mppi_mjx.py             # JAX/MJX MPPI controller (vmap + scan rollouts)
+    ├── particle_filter_mjx.py  # JAX/MJX bootstrap particle filter
+    ├── runner.py               # CLI entry point (dispatches to backend)
+    ├── runner_mjx.py           # MJX orchestration loop with timing
+    ├── test_mjx_parity.py      # Standalone MJX-vs-env parity check (100 steps)
     ├── envs/
-    │   └── pusher.py           # PusherDynamics: RNEA numpy + CUDA implementations
-    └── kernels/
-        └── pusher_kernels.py   # Raw CUDA C kernel source strings
+    │   └── pusher.py           # PusherDynamics: cost function + observation helpers
+    └── legacy/                 # Archived CUDA path (analytical backend)
+        ├── kernels/
+        │   └── pusher_kernels.py
+        ├── envs/
+        │   └── pusher.py
+        ├── gpu_utils.py
+        ├── particle_filter.py
+        ├── mppi.py
+        └── dynamics.py
 ```
+
+---
+
+## Quick Start (MJX backend)
+
+```bash
+# Install dependencies
+conda activate ml_env  # or your environment
+pip install jax jaxlib mujoco mujoco-mjx gymnasium[mujoco]
+
+# Run with perfect state (no particle filter)
+cd mppi_pf_gpu
+python runner.py --backend mjx --no-pf --K 1024 --H 50 --steps 300
+
+# Run with particle filter
+python runner.py --backend mjx --K 1024 --N 1000 --H 50 --steps 300
+
+# Record video
+python runner.py --backend mjx --no-pf --K 1024 --H 50 --record
+
+# Verify MJX-env parity (run before first use)
+python test_mjx_parity.py --steps 100
+```
+
+**Note on CPU performance:** MJX is designed for GPU-batched rollouts. On CPU, per-step planning time will be seconds (not milliseconds). The `<50ms` deadline target applies to GPU hardware. For CPU testing, use small `K` (e.g., `--K 16 --H 5`).
 
 ---
 

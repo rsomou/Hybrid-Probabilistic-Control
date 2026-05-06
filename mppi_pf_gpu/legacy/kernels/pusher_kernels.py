@@ -1,0 +1,254 @@
+"""
+kernels/pusher_kernels.py
+CUDA kernel source strings for the Pusher-v5 environment.
+
+All strings here are concatenated with the dynamics device code from
+envs/pusher.py before being passed to cp.RawKernel for JIT compilation.
+They must NOT be compiled standalone — they rely on device functions and
+#defines provided by PusherDynamics.get_cuda_dynamics_code().
+
+Layout reference
+----------------
+Particles / states:  row-major (N, STATE_DIM)  or  (K, STATE_DIM)
+Perturbations eps:   row-major (K, H, ACTION_DIM)
+u_bar:               row-major (H, ACTION_DIM)
+"""
+
+# --------------------------------------------------------------------------- #
+# MPPI rollout kernel
+# Each CUDA thread handles one trajectory sample k ∈ [0, K).
+# Rolls out H steps and accumulates the running cost.
+# --------------------------------------------------------------------------- #
+MPPI_ROLLOUT_KERNEL = r"""
+extern "C" __global__
+void mppi_rollout(
+    const float* __restrict__ initial_states,  // (K, STATE_DIM)
+    const float* __restrict__ u_bar,           // (H, ACTION_DIM)
+    const float* __restrict__ eps,             // (K, H, ACTION_DIM)
+    const float* __restrict__ action_low,      // (ACTION_DIM,)
+    const float* __restrict__ action_high,     // (ACTION_DIM,)
+    const float* __restrict__ target,          // (2,) target position
+    float*       __restrict__ costs,           // (K,)  output
+    float dt,
+    int K,
+    int H
+) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+
+    // Load initial state into registers
+    float state[STATE_DIM];
+    for (int i = 0; i < STATE_DIM; i++) {
+        state[i] = initial_states[k * STATE_DIM + i];
+    }
+
+    float total_cost = 0.0f;
+
+    for (int t = 0; t < H; t++) {
+        // Compute clipped perturbed action: u_bar[t] + eps[k, t, :]
+        float action[ACTION_DIM];
+        int eps_base = (k * H + t) * ACTION_DIM;
+        int u_base   = t * ACTION_DIM;
+        for (int a = 0; a < ACTION_DIM; a++) {
+            float u = u_bar[u_base + a] + eps[eps_base + a];
+            action[a] = fminf(fmaxf(u, action_low[a]), action_high[a]);
+        }
+
+        // Accumulate running cost before state transition
+        total_cost += cost_pusher(state, action, target, t, H);
+
+        // Advance state in place
+        f_pusher(state, action, dt);
+    }
+
+    // Terminal cost: evaluated on the final state after H transitions.
+    // Applied once — weighted by TERMINAL_WEIGHT so it dominates the
+    // running sum and forces the planner to end trajectories near the goal.
+    total_cost += terminal_cost_pusher(state, target);
+
+    costs[k] = total_cost;
+}
+"""
+
+# --------------------------------------------------------------------------- #
+# MPPI importance-weight kernel
+# Converts per-trajectory costs to unnormalised importance weights using the
+# numerically-stable shift:  w_k = exp(-(S_k - S_min) / lambda)
+# --------------------------------------------------------------------------- #
+COMPUTE_IMPORTANCE_WEIGHTS_KERNEL = r"""
+extern "C" __global__
+void compute_importance_weights(
+    const float* __restrict__ costs,    // (K,)
+    float*       __restrict__ weights,  // (K,)  output
+    float lambda_,
+    float min_cost,                     // pre-computed, passed from host
+    int K
+) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= K) return;
+    weights[k] = expf(-(costs[k] - min_cost) / lambda_);
+}
+"""
+
+# --------------------------------------------------------------------------- #
+# MPPI weighted epsilon accumulation kernel
+# Computes u_bar_delta[t, a] = sum_k( w_k * eps[k, t, a] )
+# Each thread handles one (t, a) pair — the inner loop runs over K.
+# For large K a parallel reduction would be faster; this is correct and simple.
+# --------------------------------------------------------------------------- #
+WEIGHTED_EPS_UPDATE_KERNEL = r"""
+extern "C" __global__
+void weighted_eps_update(
+    const float* __restrict__ weights,      // (K,)   normalised
+    const float* __restrict__ eps,          // (K, H, ACTION_DIM)
+    float*       __restrict__ u_bar_delta,  // (H, ACTION_DIM)  output
+    int K,
+    int H
+) {
+    // Each thread owns one (t, a) index
+    int idx   = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = H * ACTION_DIM;
+    if (idx >= total) return;
+
+    float s = 0.0f;
+    for (int k = 0; k < K; k++) {
+        // eps layout: (K, H, ACTION_DIM) row-major
+        s += weights[k] * eps[k * H * ACTION_DIM + idx];
+    }
+    u_bar_delta[idx] = s;
+}
+"""
+
+# --------------------------------------------------------------------------- #
+# Particle Filter propagation kernel
+# Applies f_pusher to every particle and adds Gaussian process noise.
+# --------------------------------------------------------------------------- #
+PF_PROPAGATE_KERNEL = r"""
+extern "C" __global__
+void pf_propagate(
+    float*       __restrict__ particles,          // (N, STATE_DIM)  in/out
+    const float* __restrict__ action,             // (ACTION_DIM,)
+    const float* __restrict__ noise,              // (N, STATE_DIM) pre-generated
+    float process_noise_std,      // std for joint dims d < 2*NUM_JOINTS
+    float process_noise_std_obj,  // std for object-state dims d >= 2*NUM_JOINTS
+    float dt,
+    int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    // Load particle into registers
+    float state[STATE_DIM];
+    for (int d = 0; d < STATE_DIM; d++) {
+        state[d] = particles[i * STATE_DIM + d];
+    }
+
+    // Copy action into a local array (required by f_pusher signature)
+    float act[ACTION_DIM];
+    for (int a = 0; a < ACTION_DIM; a++) {
+        act[a] = action[a];
+    }
+
+    // Advance dynamics in place
+    f_pusher(state, act, dt);
+
+    // Write back with per-component additive process noise:
+    //   joint dims  (d < 14):  process_noise_std  (0 — injected each step)
+    //   obj_pos     (d 14-15): process_noise_std_obj  (exploration noise)
+    //   obj_vel     (d 16-17): 0  (derived from contact dynamics)
+    //   fork_xy     (d 18-19): 0  (derived deterministically from FK)
+    //   fork_z      (d 20):    0  (derived deterministically from FK)
+    for (int d = 0; d < STATE_DIM; d++) {
+        float ns;
+        if (d < 2 * NUM_JOINTS) {
+            ns = process_noise_std;
+        } else if (d < 2 * NUM_JOINTS + 2) {
+            ns = process_noise_std_obj;   // obj_pos only
+        } else {
+            ns = 0.0f;                    // obj_vel, fork_xy, fork_z: deterministic
+        }
+        particles[i * STATE_DIM + d] = state[d] + ns * noise[i * STATE_DIM + d];
+    }
+}
+"""
+
+# --------------------------------------------------------------------------- #
+# Particle Filter weight-update kernel
+# Computes log-likelihood of each particle given the current observation.
+#
+# Rao-Blackwellisation: q/qdot are INJECTED each step, so all particles
+# share identical joint state (+ tiny jitter).  Including these dims in
+# the likelihood creates pure noise that swamps the obj_pos signal and
+# triggers pathological resampling (ESS collapses to 1-4).
+# Only the HIDDEN dimensions (obj_pos) should appear in the likelihood.
+#
+# PF obs layout (OBS_DIM = 16):
+#   [0:7]   q        — raw joint angles   (gym obs[0:7])   ← SKIP (injected)
+#   [7:14]  qdot     — joint velocities   (gym obs[7:14])  ← SKIP (injected)
+#   [14:16] obj_pos  — object xy          (gym obs[17:19]) ← USED
+#
+# Particle state layout (STATE_DIM = 21):
+#   [0:7]   q        state[0:7]   ← skip (injected)
+#   [7:14]  qdot     state[7:14]  ← skip (injected)
+#   [14:16] obj_pos  state[14:16] ← compared to obs[14:16]
+#   [16:18] obj_vel  state[16:18] ← not observed
+#   [18:20] fork_xy  state[18:20] ← not observed
+#   [20]    fork_z   state[20]    ← not observed
+#
+# Two noise scales:
+#   obs_noise_std      — tight, for joint dims d < 14
+#   obs_noise_std_obj  — looser, for obj_pos dims d >= 14
+# --------------------------------------------------------------------------- #
+PF_WEIGHT_UPDATE_KERNEL = r"""
+/* Extract the d-th predicted observation for particle i.
+   PF obs is [q(0..6), qdot(7..13), obj_x(14), obj_y(15)] — OBS_DIM=16.
+   particle state[d] for d=0..15 maps directly to obs[d].
+*/
+__device__ float particle_to_obs(const float* particles, int i, int d)
+{
+    return particles[i * STATE_DIM + d];
+}
+
+extern "C" __global__
+void pf_weight_update(
+    const float* __restrict__ particles,   // (N, STATE_DIM)
+    const float* __restrict__ observation, // (OBS_DIM,)
+    float*       __restrict__ weights,     // (N,)  in/out (multiplied)
+    float obs_noise_std,       // tight std for joint dims  d < 14
+    float obs_noise_std_obj,   // looser std for obj_pos dims d >= 14
+    int N
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float inv_var_obj   = 1.0f / (obs_noise_std_obj * obs_noise_std_obj);
+    float log_lik       = 0.0f;
+
+    // Skip q/qdot dims (d=0..13): they are Rao-Blackwellised (injected
+    // from observations), so all particles share the same joint state.
+    // Including them adds pure jitter noise → pathological ESS collapse.
+
+    // Object position dims (d = 14..15) — the only hidden-state signal
+    for (int d = 2 * NUM_JOINTS; d < OBS_DIM; d++) {
+        float pred = particle_to_obs(particles, i, d);
+        float diff = pred - observation[d];
+        log_lik   -= 0.5f * diff * diff * inv_var_obj;
+    }
+
+    // Store raw log-likelihood (NOT exp). Host code applies
+    // max-subtraction trick to avoid float32 underflow.
+    weights[i] = log_lik;
+}
+"""
+
+# --------------------------------------------------------------------------- #
+# Exported bundle: everything except the dynamics device code.
+# Consumed by particle_filter.py and mppi.py.
+# --------------------------------------------------------------------------- #
+ALL_PF_KERNELS = PF_PROPAGATE_KERNEL + PF_WEIGHT_UPDATE_KERNEL
+
+ALL_MPPI_KERNELS = (
+    MPPI_ROLLOUT_KERNEL
+    + COMPUTE_IMPORTANCE_WEIGHTS_KERNEL
+    + WEIGHTED_EPS_UPDATE_KERNEL
+)
