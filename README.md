@@ -28,53 +28,96 @@ Hybrid-Probabilistic-Control/
 
 ## Algorithm Overview
 
-The system solves a partially observable control problem where the true object position is hidden. A particle filter estimates it; MPPI plans optimal actions over that estimate.
+The system solves a discrete-time partially observable control problem:
+
+$$s_{t+1} = f(s_t, a_t) + w_t, \quad w_t \sim \mathcal{N}(0, \Sigma_p)$$
+
+$$o_t = h(s_t) + v_t, \quad v_t \sim \mathcal{N}(0, \Sigma_o)$$
+
+where $s_t$ is the state, $a_t$ is the action, $o_t$ is the observation, and the object position within $s_t$ is hidden. A particle filter estimates the posterior over $s_t$; MPPI plans optimal actions over that estimate.
 
 ### Particle Filter (State Estimation)
 
-The posterior over the state is approximated by N = 1000 weighted particles.
+The posterior $p(s_t \mid o_{0:t}, a_{0:t-1})$ is approximated by $N = 1000$ weighted particles $\{(s^{(i)}_t, w^{(i)}_t)\}_{i=1}^{N}$.
 
-**Rao-Blackwellization:** Each step, the true observed joint state (q, qdot) is injected into all particles with tiny jitter. Only the hidden object position differs between particles. This keeps the one-step contact signal as the dominant discriminator for weight updates.
+**Rao-Blackwellization:** Each step, the observed joint state $(q, \dot{q})$ is injected into all particles with tiny jitter. Only the hidden object position differs between particles. This keeps the one-step contact signal as the dominant discriminator for weight updates.
 
 Each step has three stages:
 
-1. **Propagation** - Advance each particle forward through the dynamics model on GPU (one thread per particle), then add Gaussian process noise to the object position dimensions.
+**(1) Propagation.** Advance each particle through the dynamics model (one GPU thread per particle) and add process noise:
 
-2. **Weighting** - Multiply each particle's weight by a Gaussian likelihood comparing its predicted object position against the observed position. Joint dimensions are skipped (they are identical across particles after injection). Weights are renormalized to sum to one.
+$$s_t^{(i)} \sim f(s_{t-1}^{(i)}, a_{t-1}) + \mathcal{N}(0, \sigma_p^2 I)$$
 
-3. **Resampling** - When the effective sample size ESS = 1 / sum(w_i^2) drops below 0.5 * N, draw N replacement particles using systematic resampling via cumulative sum + binary search (entirely on GPU).
+Process noise is applied only to the object position dimensions ($\sigma_p = 0.01$). Joint dimensions receive zero noise since they are injected from observations.
+
+**(2) Weighting.** Multiply each particle's weight by a Gaussian likelihood on the object position dimensions only (joint dimensions are identical across particles after injection):
+
+$$w_t^{(i)} \propto w_{t-1}^{(i)} \cdot \exp\!\left(-\frac{\|h(s_t^{(i)}) - o_t\|^2}{2\sigma_o^2}\right)$$
+
+Weights are renormalized to sum to one. Two noise scales are used: $\sigma_o = 0.01$ for joint dimensions and $\sigma_o = 0.05$ for object position.
+
+**(3) Resampling.** When the effective sample size
+
+$$\text{ESS} = \frac{1}{\sum_{i=1}^{N} (w_t^{(i)})^2}$$
+
+drops below $0.5 \times N$, draw $N$ replacement particles using systematic resampling via cumulative sum and binary search (entirely on GPU).
 
 ### MPPI (Stochastic Optimal Control)
 
-MPPI treats finite-horizon control as inference. Given a nominal action sequence u_bar (warm-started from the previous step):
+MPPI frames finite-horizon control as inference. Given a nominal action sequence $\bar{u} = \{u_0, \dots, u_{H-1}\}$ (warm-started from the previous step):
 
-1. **Sample perturbations.** Draw K = 1024 noise sequences. Noise is sampled as (K, N_CP, 7) control points, then linearly interpolated to (K, H, 7) steps. AR(1) temporal correlation (beta = 0.5) is applied for smoothness. Per-joint sigma weights control exploration per joint; joint 6 (wrist_roll) is frozen at sigma = 0.
+**(1) Sample perturbations.** Draw $K = 1024$ noise sequences. Noise is sampled as $(K, N_{CP}, 7)$ control points, then linearly interpolated to $(K, H, 7)$ steps. AR(1) temporal correlation ($\beta = 0.5$) smooths the sequences:
 
-2. **Form candidates.** Perturbed actions: u_k = clip(u_bar + eps_k, -2, 2).
+$$\varepsilon_t^{(k)} = \beta \, \varepsilon_{t-1}^{(k)} + \sqrt{1 - \beta^2} \, \eta_t^{(k)}, \quad \eta_t^{(k)} \sim \mathcal{N}(0, \sigma^2 \cdot \text{diag}(\sigma_{\text{joint}}))$$
 
-3. **Seed rollouts.** All K rollouts start from the PF weighted mean state (single estimate, tiled to K copies). Using diverse particle samples as initial states injected noise that dominated the action signal.
+Joint 6 (wrist_roll) has $\sigma_{\text{joint}}[6] = 0$ and its nominal plan $\bar{u}_{:,6}$ is pinned to zero, since $J_6 = 0$ always (zero FK offset) and it cannot transfer force to the object.
 
-4. **Roll out dynamics.** Each of the K threads rolls out H steps of RNEA dynamics on GPU, accumulating running cost plus a terminal cost at step H.
+**(2) Form candidates.**
 
-5. **Compute importance weights.** Numerically stable conversion: w_k = exp(-(S_k - S_min) / lambda). **Elite filtering** zeroes the bottom 70% of rollouts before normalization so only the top 30% lowest-cost trajectories contribute.
+$$u_t^{(k)} = \text{clip}(\bar{u}_t + \varepsilon_t^{(k)},\; -2,\; 2)$$
 
-6. **Update nominal sequence.** u_bar += sum_k(w_k * eps_k), then clip to action bounds. Joint 6 is pinned to zero.
+**(3) Seed rollouts.** All $K$ rollouts start from the PF weighted mean state (single estimate, tiled). Using diverse particle samples as initial states injected initial-condition noise that dominated the action-quality signal.
 
-7. **Execute and shift.** Apply only u_bar[0] (with EMA smoothing, alpha = 0.3), then shift the horizon forward.
+**(4) Roll out dynamics.** Each of $K$ GPU threads rolls out $H$ steps of RNEA dynamics, accumulating the total trajectory cost:
+
+$$S_k = \sum_{t=0}^{H-1} c(s_t^{(k)}, u_t^{(k)}) + c_{\text{terminal}}(s_H^{(k)})$$
+
+**(5) Compute importance weights** with numerically stable shift:
+
+$$w_k = \frac{\exp\!\left(-(S_k - S_{\min}) / \lambda\right)}{\sum_{j=1}^{K} \exp\!\left(-(S_j - S_{\min}) / \lambda\right)}$$
+
+**Elite filtering:** Only the top 30% lowest-cost trajectories contribute. Weights for the remaining 70% are zeroed before normalization.
+
+**(6) Update nominal sequence:**
+
+$$\bar{u} \leftarrow \text{clip}\!\left(\bar{u} + \sum_{k=1}^{K} w_k \, \varepsilon^{(k)},\; -2,\; 2\right)$$
+
+**(7) Execute and shift.** Apply $\bar{u}_0$ with EMA smoothing ($\alpha = 0.3$):
+
+$$a_t = \alpha \, a_{t-1} + (1 - \alpha) \, \bar{u}_0$$
+
+Then shift the horizon: $\{\bar{u}_0, \dots, \bar{u}_{H-1}\} \to \{\bar{u}_1, \dots, \bar{u}_{H-1}, 0\}$.
 
 ### Cost Function
 
-Two-term running cost with no action regularization:
+Running cost (per step):
 
-- **Goal term:** 200 * d(obj, goal)^2 - drives the object toward the target
-- **Approach term:** 15 * d(fork, obj) in 3D - pulls the fork toward the object (includes z so the arm descends to table height)
-- **Joint limit barrier:** 0.5 * sum of exponential penalties near each joint limit
+$$c(s, a) = 200 \cdot \|p_{\text{obj}} - p_{\text{goal}}\|^2 + 15 \cdot \|p_{\text{fork}} - p_{\text{obj}}\|_{\text{3D}} + 0.5 \sum_{j=1}^{7} \left(e^{-10(q_j - q_j^{\min})} + e^{-10(q_j^{\max} - q_j)}\right)$$
 
-The terminal cost at step H is 10x the running cost, forcing the planner to end trajectories in good configurations.
+where the three terms are:
+- **Goal distance** (squared) drives the object toward the target
+- **Fork-to-object distance** (3D, includes z) pulls the arm toward the object
+- **Joint limit barrier** (exponential) steers away from joint saturation
+
+Terminal cost at step $H$:
+
+$$c_{\text{terminal}}(s_H) = 10 \times c(s_H, 0)$$
+
+The 10x multiplier forces the planner to end trajectories in good configurations rather than just optimizing average cost.
 
 ### Observation Delay
 
-The PF operates with a configurable delay (d = 3 steps). Observations are buffered; the PF updates against the observation from d steps ago. For MPPI, the PF mean is propagated forward through the d recent actions on GPU to produce a current-time state estimate.
+The PF operates with a configurable delay ($d = 3$ steps). Observations are buffered; the PF updates against the observation from $d$ steps ago. For MPPI, the PF mean is propagated forward through the $d$ recent actions on GPU to produce a current-time state estimate.
 
 ---
 
