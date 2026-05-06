@@ -68,7 +68,6 @@ APPROACH_WEIGHT = 15.0    # weight on d(fork, obj) in 3D — pulls arm deeper in
 TERMINAL_WEIGHT = 10.0    # multiplier on the terminal-state cost (applied once at step H)
 JLIMIT_WEIGHT   = 0.5     # soft joint-limit avoidance — steers rollouts away from saturated joints
 JLIMIT_MARGIN   = 10.0    # barrier sharpness (1/rad) — higher = steeper penalty near limits
-BEHIND_DIST     = 0.06    # metres — approach target is this far behind the object (opposite to goal dir)
 
 # --- Arm base position in world frame (from MuJoCo Pusher-v5 MJCF) ---
 # The arm body chain starts at <body pos="0 -0.6 0"> in the MJCF.
@@ -508,15 +507,10 @@ class PusherDynamics(AnalyticalDynamics):
         # 1. Object-to-goal SQUARED distance
         obj_tgt_dist = float(np.linalg.norm(obj_pos - self._target_pos))
 
-        # 2. "Behind" position: BEHIND_DIST behind object, opposite to goal dir
-        goal_dir = self._target_pos - obj_pos
-        gd = float(np.linalg.norm(goal_dir)) + 1e-8
-        behind_pos = obj_pos - (goal_dir / gd) * BEHIND_DIST
-
-        # Fork-to-behind 3D distance (includes z — forces arm to descend)
+        # 2. Fork-to-object 3D distance (includes z — forces arm to descend)
         dz = fk_z - TABLE_Z
-        d_fork_behind = np.sqrt((fk_x - behind_pos[0])**2
-                                + (fk_y - behind_pos[1])**2 + dz**2)
+        d_fork_obj = np.sqrt((fk_x - obj_pos[0])**2
+                             + (fk_y - obj_pos[1])**2 + dz**2)
 
         # 3. Soft joint-limit barrier
         q = state[0:7]
@@ -524,7 +518,7 @@ class PusherDynamics(AnalyticalDynamics):
         hi = JOINT_Q_MAX - q
         jlim = float(np.sum(np.exp(-JLIMIT_MARGIN * lo) + np.exp(-JLIMIT_MARGIN * hi)))
 
-        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_behind + JLIMIT_WEIGHT * jlim
+        return GOAL_WEIGHT * obj_tgt_dist**2 + APPROACH_WEIGHT * d_fork_obj + JLIMIT_WEIGHT * jlim
 
     # ------------------------------------------------------------------ #
     # Observation model
@@ -703,8 +697,7 @@ def _generate_cuda_code():
         f"#define APPROACH_WEIGHT {APPROACH_WEIGHT:.6f}f\n"
         f"#define TERMINAL_WEIGHT {TERMINAL_WEIGHT:.6f}f\n"
         f"#define JLIMIT_WEIGHT {JLIMIT_WEIGHT:.6f}f\n"
-        f"#define JLIMIT_MARGIN {JLIMIT_MARGIN:.6f}f\n"
-        f"#define BEHIND_DIST {BEHIND_DIST:.6f}f\n\n"
+        f"#define JLIMIT_MARGIN {JLIMIT_MARGIN:.6f}f\n\n"
         "/* Arm base position in world frame */\n"
         "#define ARM_BASE_X  0.0f\n"
         "#define ARM_BASE_Y -0.6f\n"
@@ -1069,18 +1062,11 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
     float fk_y = state[19];
     float fk_z = state[20];
 
-    /* "Behind" position for approach alignment */
-    float gd = sqrtf(dx*dx + dy*dy) + 1e-6f;
-    float gnx = dx / gd;    /* obj-target direction (away from goal) */
-    float gny = dy / gd;
-    float bx = obj_pos[0] + gnx * BEHIND_DIST;
-    float by = obj_pos[1] + gny * BEHIND_DIST;
-
-    /* Fork-to-behind 3D distance */
-    float ddx = fk_x - bx;
-    float ddy = fk_y - by;
+    /* Fork-to-object 3D distance */
+    float ddx = fk_x - obj_pos[0];
+    float ddy = fk_y - obj_pos[1];
     float ddz = fk_z - TABLE_Z;
-    float d_fork_behind = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
+    float d_fork_obj = sqrtf(ddx*ddx + ddy*ddy + ddz*ddz);
 
     /* Soft joint-limit barrier */
     float jlim = 0.0f;
@@ -1090,7 +1076,7 @@ __device__ float terminal_cost_pusher(const float* state, const float* target)
         jlim += expf(-JLIMIT_MARGIN * lo) + expf(-JLIMIT_MARGIN * hi);
     }
 
-    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_behind
+    return TERMINAL_WEIGHT * (GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj
            + JLIMIT_WEIGHT * jlim);
 }
 
@@ -1115,19 +1101,11 @@ __device__ float cost_pusher(const float* state, const float* action,
     float dy2 = obj_pos[1] - target[1];
     float d_target = sqrtf(dx2*dx2 + dy2*dy2);
 
-    /* "Behind" position: BEHIND_DIST behind the object, opposite to goal dir.
-       Guides the fork to approach from the correct angle for pushing. */
-    float gd = sqrtf(dx2*dx2 + dy2*dy2) + 1e-6f;
-    float gnx = dx2 / gd;   /* unit vector obj → goal (reuse dx2,dy2 = obj-target) */
-    float gny = dy2 / gd;   /* note: dx2 = obj-target, so obj→goal = -dx2 */
-    float bx = obj_pos[0] + gnx * BEHIND_DIST;  /* behind = obj + (obj-goal_dir)*dist */
-    float by = obj_pos[1] + gny * BEHIND_DIST;  /* i.e. away from goal */
-
-    /* Fork-to-behind 3D (includes z — forces arm to descend toward table) */
-    float dx = fk_x - bx;
-    float dy = fk_y - by;
+    /* Fork-to-object 3D (includes z — forces arm to descend toward table) */
+    float dx = fk_x - obj_pos[0];
+    float dy = fk_y - obj_pos[1];
     float dz = fk_z - TABLE_Z;
-    float d_fork_behind = sqrtf(dx*dx + dy*dy + dz*dz);
+    float d_fork_obj = sqrtf(dx*dx + dy*dy + dz*dz);
 
     /* Soft joint-limit barrier: sum of exp penalties near each limit */
     float jlim = 0.0f;
@@ -1137,7 +1115,7 @@ __device__ float cost_pusher(const float* state, const float* action,
         jlim += expf(-JLIMIT_MARGIN * lo) + expf(-JLIMIT_MARGIN * hi);
     }
 
-    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_behind
+    return GOAL_WEIGHT * d_target * d_target + APPROACH_WEIGHT * d_fork_obj
            + JLIMIT_WEIGHT * jlim;
 }
 """
