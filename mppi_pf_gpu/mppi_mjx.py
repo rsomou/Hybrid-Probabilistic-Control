@@ -28,6 +28,7 @@ from jax import lax
 
 from dynamics_mjx import (
     step_one,
+    reset_data,
     cost_step,
     terminal_cost,
     ACTION_DIM,
@@ -90,6 +91,10 @@ class MPPI_MJX:
         self._plan_jit = None
         self._compile_time = None
 
+        # Template MJX data — created once, reused via reset_data inside JIT
+        # to avoid expensive C→JAX mjx.put_data transfer every step.
+        self._template_data = None
+
     # ------------------------------------------------------------------ #
     # Episode-level API
     # ------------------------------------------------------------------ #
@@ -137,19 +142,24 @@ class MPPI_MJX:
 
         # Build the JIT-compiled planner on first call (or if not yet built)
         if self._plan_jit is None:
+            # Create template MJX data once (used inside JIT via reset_data)
+            self._template_data = self.mjx_dyn.make_mjx_data(qpos, qvel)
             self._build_plan_jit()
 
         # Split PRNG key for this step
         self._rng_key, step_key = jax.random.split(self._rng_key)
 
-        # Create the initial MJX data from current state
-        # This is the one CPU→device transfer per step
-        mjx_data = self.mjx_dyn.make_mjx_data(qpos, qvel)
+        # Pass qpos/qvel as simple JAX arrays — state injection happens
+        # inside the JIT boundary via reset_data, avoiding the expensive
+        # C-side mj_forward + mjx.put_data transfer every step.
+        qpos_jax = jnp.array(qpos, dtype=jnp.float32)
+        qvel_jax = jnp.array(qvel, dtype=jnp.float32)
 
         # Run the JIT-compiled planning function
         t_plan_start = time.perf_counter()
         u_bar_new, costs, weights = self._plan_jit(
-            mjx_data,
+            qpos_jax,
+            qvel_jax,
             self.u_bar,
             self.target,
             step_key,
@@ -215,9 +225,13 @@ class MPPI_MJX:
         """
         Build the JIT-compiled planning function.
 
-        This captures K, H, sigma_vec, elite_frac, etc. as constants.
-        The function takes (mjx_data, u_bar, target, rng_key) and returns
-        (u_bar_new, costs, weights).
+        This captures K, H, sigma_vec, elite_frac, template_data, etc. as
+        constants.  The function takes (qpos, qvel, u_bar, target, rng_key)
+        and returns (u_bar_new, costs, weights).
+
+        State injection uses reset_data INSIDE the JIT boundary to avoid
+        the expensive C-side mj_forward + mjx.put_data transfer every step.
+        Only qpos (11,) and qvel (11,) are transferred as simple arrays.
         """
         K = self.K
         H = self.H
@@ -228,20 +242,23 @@ class MPPI_MJX:
         elite_frac = self.config.elite_frac
         fork_body_id = self._fork_body_id
         obj_body_id = self._obj_body_id
+        template_data = self._template_data
 
-        def _plan(mjx_data, u_bar, target, rng_key):
+        def _plan(qpos, qvel, u_bar, target, rng_key):
             """
             Full MPPI planning step (pure function for JIT).
 
-            1. Sample AR(1) perturbations
-            2. Rollout K trajectories via vmap(scan(step_one))
-            3. Compute costs
-            4. Importance weights + elite filtering
-            5. Weighted u_bar update
+            1. Inject state via reset_data (inside JIT — no C transfer)
+            2. Sample AR(1) perturbations
+            3. Rollout K trajectories via vmap(scan(step_one))
+            4. Compute costs
+            5. Importance weights + elite filtering
+            6. Weighted u_bar update
 
             Parameters
             ----------
-            mjx_data : mjx.Data — initial state (single, not batched)
+            qpos     : (nq,) — generalized positions
+            qvel     : (nv,) — generalized velocities
             u_bar    : (H, 7) — nominal control sequence
             target   : (2,) — goal position
             rng_key  : PRNGKey
@@ -252,6 +269,9 @@ class MPPI_MJX:
             costs     : (K,)   — per-trajectory costs
             weights   : (K,)   — normalised importance weights
             """
+            # Inject state into template data and recompute derived quantities
+            # (xpos, contacts, etc.) — all on device, no C-side transfer.
+            mjx_data = reset_data(mjx_model, template_data, qpos, qvel)
             # ---- 1. Sample temporally-correlated perturbations ----
             # eps[k, t, a] with AR(1): eps[t] = β·eps[t-1] + √(1-β²)·white[t]
             # white has per-joint sigma scaling applied.
