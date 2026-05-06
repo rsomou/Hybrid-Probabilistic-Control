@@ -34,7 +34,7 @@ $$s_{t+1} = f(s_t, a_t) + w_t, \quad w_t \sim \mathcal{N}(0, \Sigma_p)$$
 
 $$o_t = h(s_t) + v_t, \quad v_t \sim \mathcal{N}(0, \Sigma_o)$$
 
-where $s_t$ is the state, $a_t$ is the action, $o_t$ is the observation, and the object position within $s_t$ is hidden. A particle filter estimates the posterior over $s_t$; MPPI plans optimal actions over that estimate.
+where $s_t$ is the state, $a_t$ is the action, $o_t$ is the observation, and the object position within $s_t$ is hidden. A particle filter estimates the posterior over $s_t$, and MPPI plans optimal actions over that estimate.
 
 ### Particle Filter (State Estimation)
 
@@ -121,13 +121,13 @@ The 10x multiplier forces the planner to end trajectories in good configurations
 
 ### Observation Delay
 
-The PF operates with a configurable delay of $d = 3$ steps. Observations are buffered; the PF updates against the observation from $d$ steps ago. For MPPI, the PF mean is propagated forward through the $d$ recent actions on GPU to produce a current-time state estimate.
+The PF operates with a configurable delay of $d = 3$ steps. Observations are buffered, and the PF updates against the observation from $d$ steps ago. For MPPI, the PF mean is propagated forward through the $d$ recent actions on GPU to produce a current-time state estimate.
 
 ---
 
 ## CPU-GPU Interaction
 
-Each control step follows this sequence. All heavy computation runs on the GPU; the CPU only orchestrates the order of kernel launches and handles the environment step.
+Each control step follows this sequence. All heavy computation runs on the GPU. The CPU only orchestrates the order of kernel launches and handles the environment step.
 
 ```
 CPU (runner.py)                          GPU (CUDA kernels)
@@ -234,7 +234,7 @@ Scheduler     : K mean=1152  range=[640, 2048]  std=312
 
 ## Pusher-v5 Environment
 
-Pusher-v5 is a MuJoCo environment where a 7-DOF robotic arm pushes a small cylinder to a fixed goal on a table. The arm is controlled by 7 joint torques clipped to [-2, 2]; the object moves only through contact with the wrist fork (geoms 13-15).
+Pusher-v5 is a MuJoCo environment where a 7-DOF robotic arm pushes a small cylinder to a fixed goal on a table. The arm is controlled by 7 joint torques clipped to [-2, 2]. The object moves only through contact with the wrist fork (geoms 13-15).
 
 **Observation (23-dim):** q(7), qdot(7), fingertip_xyz(3), obj_xyz(3), goal_xyz(3)
 
@@ -245,7 +245,7 @@ The planning model uses **full RNEA (Recursive Newton-Euler Algorithm)**:
 - **Mass matrix:** 7x7 coupled mass matrix M(q) computed via CRBA, plus armature diagonal
 - **Forward dynamics:** Cholesky solve of M(q) * qddot = tau - damping * qdot - bias(q, qdot)
 - **Integration:** 5 semi-implicit Euler substeps per control step (inner dt = 0.01 s)
-- **Joint limits:** All 7 joints have position limits matching the MJCF; velocity zeroed on contact
+- **Joint limits:** All 7 joints have position limits matching the MJCF. Velocity is zeroed on contact
 - **FK:** Full 7-DOF forward kinematics returning the r_wrist_roll_link body origin (fork collision center)
 - **Contact:** When 3D fork-to-object distance < 0.25 m, a push force proportional to fork velocity in the contact normal direction is applied to the object
 
@@ -276,7 +276,7 @@ All hyperparameters live in `config.py` as a single dataclass.
 | `obs_noise_std_obj` | 0.05 | Likelihood noise for object position |
 | `inject_noise_std` | 0.001 | Jitter on injected q/qdot |
 | `resample_threshold` | 0.5 | Resample when ESS < threshold * N |
-| `K` | 1024 | MPPI trajectory samples (initial; adapted if scheduler active) |
+| `K` | 1024 | MPPI trajectory samples (initial, adapted if scheduler active) |
 | `H` | 20 | MPPI planning horizon |
 | `lambda_` | 200.0 | MPPI temperature |
 | `sigma` | 0.8 | MPPI perturbation scale |
